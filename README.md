@@ -21,7 +21,7 @@
 - Node.js 22.x
 - pnpm 10.x (`packageManager`에 고정된 버전 권장)
 - MySQL 8 호환 데이터베이스 또는 TiDB
-- 음성 TTS 기능 사용 시 Python 3와 `edge-tts`
+- 음성 질문 사용 시 별도 GPU `services/qwen3-tts` 사이드카와 읽기 전용 Qwen3-TTS 모델
 - 한글 PDF 생성 시 Noto Sans CJK KR Regular/Bold 글꼴
 
 ```bash
@@ -53,7 +53,8 @@ pnpm dev
 | `OWNER_OPEN_ID` | 선택 | 최초 운영자 역할 매핑 |
 | `BUILT_IN_FORGE_API_URL` | AI 기능 사용 시 | 서버 측 AI·스토리지 API 기준 URL |
 | `BUILT_IN_FORGE_API_KEY` | AI 기능 사용 시 | 서버 측 AI·스토리지 비밀키 |
-| `SUPERTONIC2_TTS_URL` | 선택 | 별도 TTS 서비스 URL |
+| `QWEN3_TTS_URL`, `QWEN3_TTS_TOKEN` | 선택 | 자체 호스팅 Qwen3-TTS 한국어 음성 서비스 |
+| `SUPERTONIC3_TTS_URL` | 선택 | 자체 호스팅 경량 TTS 폴백 |
 | `VITE_TOSS_CLIENT_KEY` | Toss 사용 시 | 브라우저에 공개되는 Toss 클라이언트 키 |
 | `TOSS_SECRET_KEY` | Toss 사용 시 | 서버 전용 Toss 시크릿 키 |
 | `SCHEDULER_SECRET` | 스케줄 API 사용 시 | 수동 스케줄 실행 보호값, 최소 32자 |
@@ -100,9 +101,9 @@ curl --get \
 
 - `server/assets/fonts/NotoSansCJK-Regular.ttc`
 - `server/assets/fonts/NotoSansCJK-Bold.ttc`
-- Python 3의 `edge_tts` 모듈
+- GPU 추론 서비스의 Qwen3-TTS 1.7B 모델과 `services/qwen3-tts` 컨테이너
 
-리눅스 시스템에 Noto CJK 글꼴을 설치해 `/usr/share/fonts/opentype/noto/`에서 제공해도 PDF 생성기가 탐색합니다. TTS는 임시 MP3를 `/tmp`에 만든 뒤 스토리지에 업로드하므로 쓰기 가능한 임시 공간과 외부 네트워크 정책을 확인해야 합니다.
+리눅스 시스템에 Noto CJK 글꼴을 설치해 `/usr/share/fonts/opentype/noto/`에서 제공해도 PDF 생성기가 탐색합니다. Qwen3-TTS 질문 음성은 메모리 WAV로만 반환하며 DB, S3, CDN, 임시 파일에 저장하지 않습니다. 서버 측 외부 Edge TTS 경로는 제거했습니다.
 
 ## 보안·개인정보 원칙
 
