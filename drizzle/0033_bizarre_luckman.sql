@@ -1,0 +1,1 @@
+ALTER TABLE `users` ADD `targetScore` int DEFAULT 70;

@@ -1,0 +1,23 @@
+CREATE TABLE `ai_evaluation_results` (
+	`id` int AUTO_INCREMENT NOT NULL,
+	`sessionId` int NOT NULL,
+	`userId` int NOT NULL,
+	`emotionData` text,
+	`dominantEmotion` varchar(50),
+	`emotionScore` int,
+	`attentionScore` int,
+	`focusTime` int,
+	`blinkCount` int,
+	`blinkRate` int,
+	`gazeDistribution` text,
+	`voiceConfidence` int,
+	`avgPitch` int,
+	`avgVolume` int,
+	`tremor` int,
+	`pauseCount` int,
+	`overallScore` int,
+	`feedback` text,
+	`createdAt` timestamp NOT NULL DEFAULT (now()),
+	`updatedAt` timestamp NOT NULL DEFAULT (now()) ON UPDATE CURRENT_TIMESTAMP,
+	CONSTRAINT `ai_evaluation_results_id` PRIMARY KEY(`id`)
+);
