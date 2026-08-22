@@ -257,7 +257,7 @@ export default function Interview() {
   const [questionGenerationError, setQuestionGenerationError] = useState<string | null>(null);
   const [wizardCompany, setWizardCompany] = useState("");
   const [wizardPosition, setWizardPosition] = useState("");
-  const [selectedInterviewStages, setSelectedInterviewStages] = useState<Array<"basic" | "personality" | "situational" | "strategy" | "deep">>(["basic"]);
+  const [selectedInterviewStages, setSelectedInterviewStages] = useState<Array<"basic" | "personality" | "situational" | "strategy" | "deep">>(["basic", "personality", "situational", "strategy", "deep"]);
   const [recordingMode, setRecordingMode] = useState<"manual" | "automatic">("manual");
   const [silenceThreshold, setSilenceThreshold] = useState(3);
   const questionGenerationTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
