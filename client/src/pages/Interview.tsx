@@ -52,6 +52,7 @@ import { QuestionShareModal } from "@/components/QuestionShareModal";
 import CouponInputModal from "@/components/CouponInputModal";
 import { ReviewIncentiveDialog } from "@/components/ReviewIncentiveDialog";
 import InterviewMediaCheck from "@/components/InterviewMediaCheck";
+import InterviewCheckpoint from "@/components/InterviewCheckpoint";
 
 import AnalyzingLoader from "@/components/AnalyzingLoader";
 import { 
@@ -284,7 +285,7 @@ export default function Interview() {
   const [speechRecognition, setSpeechRecognition] = useState<any>(null);
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [ttsEnabled, setTtsEnabled] = useState(true);
-  const [ttsSpeed, setTtsSpeed] = useState(1.15); // 0.8 ~ 1.5, 기본값 1.15배속
+  const [ttsSpeed, setTtsSpeed] = useState(0.98); // 0.8 ~ 1.5, 기본값 1.15배속
   const [ttsTone, setTtsTone] = useState<'calm' | 'energetic' | 'professional'>('professional');
   const [ttsVoiceType, setTtsVoiceType] = useState<string>('natural'); // 음성 유형 선택
   const [customPitch, setCustomPitch] = useState(1.0); // 사용자 맞춤 음높이 (0.5 ~ 1.5, 기본값 1.0)
@@ -1078,7 +1079,7 @@ export default function Interview() {
       
       ${qa.suggestedAnswer ? `
       <div class="answer-section feedback-box suggested">
-        <div class="section-title">💡 모범 답안</div>
+        <div class="section-title">💡 내 답변을 고친 예시</div>
         <p>${escapeHtmlWithBreaks(qa.suggestedAnswer)}</p>
       </div>
       ` : ''}
@@ -3156,8 +3157,8 @@ export default function Interview() {
               </div>
               <AnalyzingLoader
                 stepLabels={voiceMode
-                  ? ["음성 분석 중", "답변 내용 분석 중", "모범 답안 생성 중", "피드백 정리 완료"]
-                  : ["답변 분석 중", "핵심 내용 정리 중", "모범 답안 생성 중", "피드백 정리 완료"]}
+                  ? ["음성 분석 중", "답변 내용 분석 중", "내 답변을 고친 예시 생성 중", "피드백 정리 완료"]
+                  : ["답변 분석 중", "핵심 내용 정리 중", "내 답변을 고친 예시 생성 중", "피드백 정리 완료"]}
                 message="답변의 핵심 내용과 전달 방식을 분석하고 있습니다."
               />
             </CardContent>
@@ -3623,7 +3624,7 @@ export default function Interview() {
                   }
                   
                   if (qa.suggestedAnswer) {
-                    markdown += `### 💡 모범 답안\n${qa.suggestedAnswer}\n\n`;
+                    markdown += `### 💡 내 답변을 고친 예시\n${qa.suggestedAnswer}\n\n`;
                   }
                   
                   markdown += `---\n\n`;
@@ -4225,13 +4226,13 @@ export default function Interview() {
                     <div className="w-full mt-3 space-y-3" role="status" aria-live="polite" aria-label="AI 피드백 생성 중">
                       <AnalyzingLoader
                         stepLabels={voiceMode
-                  ? ["음성 분석 중", "답변 내용 분석 중", "모범 답안 생성 중", "피드백 정리 완료"]
-                  : ["답변 분석 중", "핵심 내용 정리 중", "모범 답안 생성 중", "피드백 정리 완료"]}
+                  ? ["음성 분석 중", "답변 내용 분석 중", "내 답변을 고친 예시 생성 중", "피드백 정리 완료"]
+                  : ["답변 분석 중", "핵심 내용 정리 중", "내 답변을 고친 예시 생성 중", "피드백 정리 완료"]}
                         message="답변의 핵심 내용과 전달 방식을 분석하고 있습니다."
                       />
                       <div className="rounded-xl border border-primary/20 bg-primary/5 p-4 space-y-3">
                         <div className="flex items-center justify-between">
-                          <span className="text-xs font-semibold text-primary">AI 모범 답안 생성 중</span>
+                          <span className="text-xs font-semibold text-primary">AI 내 답변을 고친 예시 생성 중</span>
                           <span className="text-xs text-muted-foreground">2/2</span>
                         </div>
                         <Skeleton className="h-3 w-[88%]" />
@@ -4476,7 +4477,7 @@ export default function Interview() {
                 {(currentQA.suggestedAnswerShort || currentQA.suggestedAnswerLong || currentQA.suggestedAnswer) && (
                   <div>
                     <div className="flex items-center justify-between mb-2">
-                      <p className="text-sm font-medium text-primary">모범 답안</p>
+                      <p className="text-sm font-medium text-primary">내 답변을 고친 예시</p>
                       {currentQA.suggestedAnswerShort && currentQA.suggestedAnswerLong && (
                         <div className="flex gap-2">
                           <button
@@ -4729,6 +4730,8 @@ export default function Interview() {
               </CardContent>
             </Card>
 
+            <InterviewCheckpoint answers={qas} />
+
             {/* 추가 기능 버튼 */}
             <div className="flex flex-wrap justify-center gap-2 mb-4">
               {questionIndex > 0 && (
@@ -4767,27 +4770,6 @@ export default function Interview() {
                 <Sparkles className="w-4 h-4" />
                 추천 후속 질문
               </Button>
-              {qas[questionIndex]?.userAnswer && (
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => {
-                    const currentQA = qas[questionIndex];
-                    if (currentQA?.userAnswer && 'speechSynthesis' in window) {
-                      window.speechSynthesis.cancel();
-                      const utterance = new SpeechSynthesisUtterance(currentQA.userAnswer);
-                      utterance.lang = 'ko-KR';
-                      utterance.rate = 1.0;
-                      window.speechSynthesis.speak(utterance);
-                      toast.success("내 답변을 읽어드립니다");
-                    }
-                  }}
-                  className="gap-2"
-                >
-                  <Volume2 className="w-4 h-4" />
-                  내 답변 듣기
-                </Button>
-              )}
             </div>
 
             <div className="flex justify-center pb-6">
