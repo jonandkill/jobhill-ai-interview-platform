@@ -80,7 +80,7 @@ function makeTrial(mode: AdaptiveGameMode, round: number, history: string[]): Tr
     return { prompt: `${number} ${symbol} · 짝수이면서 별이 아닌가요?`, choices: ["조건 충족", "조건 불충족"], answer };
   }
   const safe = Math.random() > 0.5;
-  return { prompt: safe ? "확정 60점과 50% 확률의 100점 중 선택" : "확정 40점과 70% 확률의 70점 중 선택", choices: ["확정 선택", "확률 선택"], answer: "확정 선택" };
+  return { prompt: safe ? "확정 60점과 50% 확률의 100점 중 선택" : "확정 40점과 70% 확률의 70점 중 선택", choices: ["확정 선택", "확률 선택"], answer: safe ? "확정 선택" : "확률 선택" };
 }
 
 export default function AdaptiveCognitiveGame({ definition, onComplete }: { definition: AdaptiveGameDefinition; onComplete: (score: number, timeMs: number, mistakes: number, metadata: string) => void }) {
