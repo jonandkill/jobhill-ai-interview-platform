@@ -746,7 +746,7 @@ export default function RealInterview() {
         sessionType: "voice_interview",
         totalQuestions: settings.questionCount,
         isVoiceMode: true,
-        interviewStages: selectedStages
+        planMode: "structured"
       });
       
       setSessionId(session.id);
