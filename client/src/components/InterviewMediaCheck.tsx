@@ -1,8 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { AlertCircle, Camera, CheckCircle2, Loader2, Mic, RotateCcw, Square } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import {
+  acquireMediaStreamWithRetry,
+  createSingleFlight,
+  getMediaErrorName,
+  stopMediaStream,
+  waitForMediaRelease,
+} from "@/lib/mediaDeviceLifecycle";
 
-type MediaCheckState = "idle" | "requesting" | "ready" | "error";
+type MediaCheckState = "idle" | "releasing" | "requesting" | "ready" | "error";
 
 interface InterviewMediaCheckProps {
   audio?: boolean;
@@ -13,10 +20,21 @@ interface InterviewMediaCheckProps {
 }
 
 function getMediaErrorMessage(error: unknown) {
-  if (error instanceof DOMException) {
-    if (error.name === "NotAllowedError") return "브라우저 주소창의 카메라·마이크 권한을 허용해주세요.";
-    if (error.name === "NotFoundError") return "사용할 수 있는 카메라 또는 마이크를 찾지 못했습니다.";
-    if (error.name === "NotReadableError") return "다른 앱이 장치를 사용 중입니다. 해당 앱을 닫고 다시 시도해주세요.";
+  const name = getMediaErrorName(error);
+  if (name === "NotAllowedError" || name === "PermissionDeniedError") {
+    return "브라우저 주소창의 카메라·마이크 권한을 허용해주세요.";
+  }
+  if (name === "NotFoundError" || name === "DevicesNotFoundError") {
+    return "사용할 수 있는 카메라 또는 마이크를 찾지 못했습니다.";
+  }
+  if (name === "NotReadableError" || name === "TrackStartError") {
+    return "다른 앱이나 브라우저 탭이 장치를 사용 중입니다. 해당 앱을 닫고 다시 시도해주세요.";
+  }
+  if (name === "OverconstrainedError") {
+    return "선택한 장치 설정을 사용할 수 없습니다. 기본 카메라·마이크로 다시 시도해주세요.";
+  }
+  if (name === "AbortError") {
+    return "장치 연결이 일시적으로 중단되었습니다. 잠시 후 다시 점검해주세요.";
   }
   return "장치를 시작하지 못했습니다. 연결 상태와 브라우저 권한을 확인해주세요.";
 }
@@ -33,44 +51,107 @@ export default function InterviewMediaCheck({
   const audioContextRef = useRef<AudioContext | null>(null);
   const frameRef = useRef<number | null>(null);
   const requestIdRef = useRef(0);
+  const requestAbortRef = useRef<AbortController | null>(null);
+  const requestGateRef = useRef(createSingleFlight<void>());
+  const mountedRef = useRef(true);
   const [state, setState] = useState<MediaCheckState>("idle");
   const [errorMessage, setErrorMessage] = useState("");
   const [micLevel, setMicLevel] = useState(0);
   const [deviceNames, setDeviceNames] = useState({ camera: "카메라", microphone: "마이크" });
 
-  const stop = useCallback(() => {
-    requestIdRef.current += 1;
+  const releaseActiveMedia = useCallback(async () => {
+    const hadActiveMedia = Boolean(streamRef.current || audioContextRef.current);
+
     if (frameRef.current !== null) cancelAnimationFrame(frameRef.current);
     frameRef.current = null;
-    streamRef.current?.getTracks().forEach(track => track.stop());
-    streamRef.current = null;
-    if (videoRef.current) videoRef.current.srcObject = null;
-    void audioContextRef.current?.close();
-    audioContextRef.current = null;
-    setMicLevel(0);
-    setState("idle");
-    onReadyChange?.(false);
-  }, [onReadyChange]);
 
-  const start = useCallback(async () => {
+    const stream = streamRef.current;
+    streamRef.current = null;
+    stopMediaStream(stream);
+
+    if (videoRef.current) videoRef.current.srcObject = null;
+
+    const audioContext = audioContextRef.current;
+    audioContextRef.current = null;
+    if (audioContext && audioContext.state !== "closed") {
+      try {
+        await audioContext.close();
+      } catch {
+        // Device cleanup remains best-effort across mobile browser implementations.
+      }
+    }
+
+    if (mountedRef.current) setMicLevel(0);
+    return hadActiveMedia;
+  }, []);
+
+  const dispose = useCallback(() => {
+    requestIdRef.current += 1;
+    requestAbortRef.current?.abort();
+    requestAbortRef.current = null;
+    onReadyChange?.(false);
+    void releaseActiveMedia();
+  }, [onReadyChange, releaseActiveMedia]);
+
+  const stop = useCallback(() => {
+    const stopRequestId = ++requestIdRef.current;
+    requestAbortRef.current?.abort();
+    requestAbortRef.current = null;
+    onReadyChange?.(false);
+    if (mountedRef.current) setState("releasing");
+
+    void releaseActiveMedia().finally(() => {
+      if (mountedRef.current && stopRequestId === requestIdRef.current) {
+        setErrorMessage("");
+        setState("idle");
+      }
+    });
+  }, [onReadyChange, releaseActiveMedia]);
+
+  const start = useCallback(() => requestGateRef.current.run(async () => {
     if (!navigator.mediaDevices?.getUserMedia) {
-      setErrorMessage("이 브라우저는 카메라·마이크 점검을 지원하지 않습니다. 최신 브라우저를 사용해주세요.");
-      setState("error");
+      if (mountedRef.current) {
+        setErrorMessage("이 브라우저는 카메라·마이크 점검을 지원하지 않습니다. 최신 브라우저를 사용해주세요.");
+        setState("error");
+      }
       onReadyChange?.(false);
       return;
     }
 
-    stop();
     const requestId = ++requestIdRef.current;
-    setState("requesting");
-    setErrorMessage("");
+    requestAbortRef.current?.abort();
+    const controller = new AbortController();
+    requestAbortRef.current = controller;
+    onReadyChange?.(false);
+
+    if (mountedRef.current) {
+      setState("releasing");
+      setErrorMessage("");
+    }
+
+    const hadActiveMedia = await releaseActiveMedia();
+    if (controller.signal.aborted || requestId !== requestIdRef.current) return;
+
+    // Some mobile camera services need one paint after track.stop() before reacquisition.
+    if (hadActiveMedia) await waitForMediaRelease(150, controller.signal);
+    if (controller.signal.aborted || requestId !== requestIdRef.current) return;
+
+    if (mountedRef.current) setState("requesting");
+
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: audio ? { echoCancellation: true, noiseSuppression: true, autoGainControl: true } : false,
-        video: video ? { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 720 } } : false,
+      const stream = await acquireMediaStreamWithRetry({
+        getUserMedia: constraints => navigator.mediaDevices.getUserMedia(constraints),
+        constraints: {
+          audio: audio ? { echoCancellation: true, noiseSuppression: true, autoGainControl: true } : false,
+          video: video ? { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 720 } } : false,
+        },
+        signal: controller.signal,
+        maxBusyRetries: 1,
+        retryDelayMs: 1_000,
       });
-      if (requestId !== requestIdRef.current) {
-        stream.getTracks().forEach(track => track.stop());
+
+      if (controller.signal.aborted || requestId !== requestIdRef.current) {
+        stopMediaStream(stream);
         return;
       }
       streamRef.current = stream;
@@ -80,48 +161,87 @@ export default function InterviewMediaCheck({
         await videoRef.current.play();
       }
 
+      if (controller.signal.aborted || requestId !== requestIdRef.current) {
+        stopMediaStream(stream);
+        return;
+      }
+
       const cameraTrack = stream.getVideoTracks()[0];
       const microphoneTrack = stream.getAudioTracks()[0];
-      setDeviceNames({
-        camera: cameraTrack?.label || "사용 중인 카메라",
-        microphone: microphoneTrack?.label || "사용 중인 마이크",
-      });
+      if (mountedRef.current) {
+        setDeviceNames({
+          camera: cameraTrack?.label || "사용 중인 카메라",
+          microphone: microphoneTrack?.label || "사용 중인 마이크",
+        });
+      }
+
+      const handleUnexpectedEnd = () => {
+        if (controller.signal.aborted || requestId !== requestIdRef.current) return;
+        requestIdRef.current += 1;
+        controller.abort();
+        requestAbortRef.current = null;
+        onReadyChange?.(false);
+        if (mountedRef.current) {
+          setErrorMessage("카메라 또는 마이크 연결이 해제되었습니다. 장치를 확인한 뒤 다시 점검해주세요.");
+          setState("error");
+        }
+        void releaseActiveMedia();
+      };
+      stream.getTracks().forEach(track => track.addEventListener("ended", handleUnexpectedEnd, { once: true }));
 
       if (audio && microphoneTrack) {
-        const AudioContextClass = window.AudioContext;
-        const context = new AudioContextClass();
+        const context = new window.AudioContext();
         audioContextRef.current = context;
+        if (context.state === "suspended") {
+          try {
+            await context.resume();
+          } catch {
+            // The stream is still usable even if a browser delays the level meter.
+          }
+        }
         const analyser = context.createAnalyser();
         analyser.fftSize = 256;
         context.createMediaStreamSource(new MediaStream([microphoneTrack])).connect(analyser);
         const values = new Uint8Array(analyser.frequencyBinCount);
         const updateLevel = () => {
+          if (controller.signal.aborted || requestId !== requestIdRef.current) return;
           analyser.getByteFrequencyData(values);
           const average = values.reduce((sum, value) => sum + value, 0) / values.length;
-          setMicLevel(Math.min(100, Math.round(average * 2.2)));
+          if (mountedRef.current) setMicLevel(Math.min(100, Math.round(average * 2.2)));
           frameRef.current = requestAnimationFrame(updateLevel);
         };
         updateLevel();
       }
 
-      setState("ready");
+      if (mountedRef.current) setState("ready");
       onReadyChange?.(true);
     } catch (error) {
-      streamRef.current?.getTracks().forEach(track => track.stop());
-      streamRef.current = null;
-      setErrorMessage(getMediaErrorMessage(error));
-      setState("error");
+      if (controller.signal.aborted || requestId !== requestIdRef.current) return;
+      await releaseActiveMedia();
+      if (mountedRef.current) {
+        setErrorMessage(getMediaErrorMessage(error));
+        setState("error");
+      }
       onReadyChange?.(false);
+    } finally {
+      if (requestAbortRef.current === controller) requestAbortRef.current = null;
     }
-  }, [audio, onReadyChange, stop, video]);
+  }), [audio, onReadyChange, releaseActiveMedia, video]);
 
   useEffect(() => {
+    mountedRef.current = true;
     if (autoStart) void start();
-    return stop;
-  }, [autoStart, start, stop]);
+    return () => {
+      mountedRef.current = false;
+      dispose();
+    };
+  }, [autoStart, dispose, start]);
+
+  const isBusy = state === "releasing" || state === "requesting";
+  const busyLabel = state === "releasing" ? "장치 정리 중..." : "권한 확인 중...";
 
   return (
-    <section className={`overflow-hidden rounded-xl border bg-card ${compact ? "p-3" : "p-4"}`} aria-label="카메라와 마이크 사전 점검">
+    <section className={`overflow-hidden rounded-xl border bg-card ${compact ? "p-3" : "p-4"}`} aria-label="카메라와 마이크 사전 점검" aria-busy={isBusy}>
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
           <h3 className="flex items-center gap-2 font-semibold"><Camera className="h-4 w-4 text-primary" /> 장치 사전 점검</h3>
@@ -133,7 +253,7 @@ export default function InterviewMediaCheck({
       {video && (
         <div className={`relative mt-3 overflow-hidden rounded-lg bg-slate-950 ${compact ? "aspect-video max-h-48" : "aspect-video"}`}>
           <video ref={videoRef} muted playsInline className="h-full w-full scale-x-[-1] object-cover" aria-label="카메라 셀프뷰" />
-          {state !== "ready" && <div className="absolute inset-0 flex items-center justify-center text-sm text-slate-300"><Camera className="mr-2 h-5 w-5" /> 점검을 시작하면 셀프뷰가 표시됩니다</div>}
+          {state !== "ready" && <div className="absolute inset-0 flex items-center justify-center text-sm text-slate-300"><Camera className="mr-2 h-5 w-5" /> {isBusy ? busyLabel : "점검을 시작하면 셀프뷰가 표시됩니다"}</div>}
         </div>
       )}
 
@@ -151,7 +271,7 @@ export default function InterviewMediaCheck({
         </dl>
       )}
 
-      {state === "error" && <div className="mt-3 flex items-start gap-2 rounded-lg bg-destructive/10 p-3 text-xs text-destructive"><AlertCircle className="mt-0.5 h-4 w-4 shrink-0" /><p>{errorMessage}</p></div>}
+      {state === "error" && <div className="mt-3 flex items-start gap-2 rounded-lg bg-destructive/10 p-3 text-xs text-destructive" role="alert"><AlertCircle className="mt-0.5 h-4 w-4 shrink-0" /><p>{errorMessage}</p></div>}
 
       {compact && state === "error" && (
         <Button type="button" variant="outline" className="mt-3 min-h-11 w-full gap-2" onClick={() => void start()}>
@@ -162,9 +282,9 @@ export default function InterviewMediaCheck({
       {!compact && (
         <div className="mt-3 flex gap-2">
           {state !== "ready" ? (
-            <Button type="button" className="min-h-11 flex-1 gap-2" onClick={() => void start()} disabled={state === "requesting"}>
-              {state === "requesting" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Camera className="h-4 w-4" />}
-              {state === "requesting" ? "권한 확인 중..." : state === "error" ? "다시 점검" : "카메라·마이크 점검"}
+            <Button type="button" className="min-h-11 flex-1 gap-2" onClick={() => void start()} disabled={isBusy}>
+              {isBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Camera className="h-4 w-4" />}
+              {isBusy ? busyLabel : state === "error" ? "다시 점검" : "카메라·마이크 점검"}
             </Button>
           ) : (
             <>
