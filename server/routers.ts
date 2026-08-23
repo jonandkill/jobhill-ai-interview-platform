@@ -531,9 +531,19 @@ export const appRouter = router({  system: systemRouter,
         const subscription = await db.getUserActiveSubscription(ctx.user.id);
         const hasFreeTrial = Boolean(user.freeTrialEndsAt && new Date() < user.freeTrialEndsAt);
         
-        // 음성 면접 활성화 확인
-        if (input.isVoiceMode && !user.voiceInterviewEnabled && !subscription) {
-          throw new Error("음성 면접은 월정액 결제 후 이용하실 수 있습니다.");
+        // 구독·무료체험·음성 이용권 또는 답변 크레딧이 있으면 화상·음성 면접을 시작할 수 있습니다.
+        // 클라이언트의 첫 무료 음성 면접 안내와 서버 권한 기준을 일치시킵니다.
+        const canUseVoiceInterview = Boolean(
+          user.voiceInterviewEnabled ||
+          subscription ||
+          hasFreeTrial ||
+          (user.questionCredits || 0) > 0,
+        );
+        if (input.isVoiceMode && !canUseVoiceInterview) {
+          throw new TRPCError({
+            code: "FORBIDDEN",
+            message: "음성·화상 면접을 시작할 이용권 또는 질문 크레딧이 부족합니다.",
+          });
         }
         
         // 실제 답변 제출과 동일한 권한 기준을 사용합니다. 세션 생성 자체는 크레딧을 차감하지 않습니다.
