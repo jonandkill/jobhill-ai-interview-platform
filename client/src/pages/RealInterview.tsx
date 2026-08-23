@@ -557,7 +557,12 @@ export default function RealInterview() {
       );
       
       // Whisper API 호출
+      if (!sessionId) {
+        toast.error("음성 면접 세션을 찾을 수 없습니다.");
+        return;
+      }
       const result = await whisperTranscribeMutation.mutateAsync({
+        sessionId,
         audioBase64: base64,
         mimeType: 'audio/webm',
         language: 'ko'
@@ -574,7 +579,7 @@ export default function RealInterview() {
       toast.error("음성 변환에 실패했습니다.");
       await handleSubmitAnswer("");
     }
-  }, [whisperTranscribeMutation]);
+  }, [whisperTranscribeMutation, sessionId]);
   
   // 답변 제출
   const handleSubmitAnswer = useCallback(async (answerText: string) => {

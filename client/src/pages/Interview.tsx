@@ -451,7 +451,7 @@ export default function Interview() {
   const recordingAudioContextRef = useRef<AudioContext | null>(null);
   const recordingSilenceIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const recordingStartPendingRef = useRef(false);
-  const autoRecordTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const autoRecordTimeoutRef = useRef<number | null>(null);
   const [audioChunks, setAudioChunks] = useState<Blob[]>([]);
   const [isRecording, setIsRecording] = useState(false);
   const audioPlayerRef = useState<HTMLAudioElement | null>(null);
@@ -536,7 +536,9 @@ export default function Interview() {
       const arrayBuffer = await blob.arrayBuffer();
       const bytes = new Uint8Array(arrayBuffer);
       let binary = "";
-      for (const byte of bytes) binary += String.fromCharCode(byte);
+      for (let index = 0; index < bytes.length; index += 1) {
+        binary += String.fromCharCode(bytes[index]);
+      }
       whisperTranscribeMutation.mutate({
         sessionId,
         audioBase64: btoa(binary),
@@ -634,8 +636,8 @@ export default function Interview() {
         recordingSilenceIntervalRef.current = setInterval(() => {
           analyser.getByteTimeDomainData(dataArray);
           let sum = 0;
-          for (const sample of dataArray) {
-            const normalized = (sample - 128) / 128;
+          for (let index = 0; index < dataArray.length; index += 1) {
+            const normalized = (dataArray[index] - 128) / 128;
             sum += normalized * normalized;
           }
           const rms = Math.sqrt(sum / dataArray.length);
@@ -872,9 +874,6 @@ export default function Interview() {
         stopRecording();
       } else {
         await startRecording();
-        if (mediaRecorderRef.current?.state === "recording") {
-          toast.success("음성 녹음을 시작합니다. 말씀해주세요!");
-        }
       }
       return;
     }
