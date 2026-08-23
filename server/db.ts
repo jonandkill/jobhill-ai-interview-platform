@@ -4,6 +4,7 @@ import {
   getStoredAssessmentId,
   type GameAssessmentId,
 } from "@shared/gameAssessments";
+import { getAnsweredUniqueFollowUps } from "@shared/interviewFollowUps";
 import { drizzle } from "drizzle-orm/mysql2";
 import { 
   InsertUser, users, 
@@ -2132,12 +2133,15 @@ export async function getFollowUpHistoryByUser(userId: number) {
     .orderBy(desc(followUpHistory.createdAt));
 }
 
-export async function getFollowUpHistoryBySession(sessionId: number) {
+export async function getFollowUpHistoryBySession(userId: number, sessionId: number) {
   const db = await getDb();
   if (!db) return [];
   
   return db.select().from(followUpHistory)
-    .where(eq(followUpHistory.sessionId, sessionId))
+    .where(and(
+      eq(followUpHistory.userId, userId),
+      eq(followUpHistory.sessionId, sessionId),
+    ))
     .orderBy(desc(followUpHistory.createdAt));
 }
 
@@ -2539,18 +2543,24 @@ export async function getUserEmail(userId: number): Promise<string | null> {
 
 
 // 세션별 후속 질문 통계 조회
-export async function getFollowUpStatsBySession(sessionId: number) {
+export async function getFollowUpStatsBySession(userId: number, sessionId: number) {
   const db = await getDb();
   if (!db) return { count: 0, avgScore: 0, totalScore: 0 };
   
-  const results = await db.select().from(followUpHistory)
-    .where(eq(followUpHistory.sessionId, sessionId));
+  const results = getAnsweredUniqueFollowUps(
+    await db.select().from(followUpHistory)
+      .where(and(
+        eq(followUpHistory.userId, userId),
+        eq(followUpHistory.sessionId, sessionId),
+      ))
+      .orderBy(desc(followUpHistory.createdAt)),
+  );
   
   if (results.length === 0) {
     return { count: 0, avgScore: 0, totalScore: 0 };
   }
   
-  const scores = results.filter(r => r.followUpScore !== null).map(r => r.followUpScore as number);
+  const scores = results.map(r => r.followUpScore as number);
   const totalScore = scores.reduce((sum, score) => sum + score, 0);
   const avgScore = scores.length > 0 ? Math.round(totalScore / scores.length) : 0;
   
@@ -2574,21 +2584,24 @@ export async function getFollowUpStatsByUser(userId: number) {
   const db = await getDb();
   if (!db) return { totalCount: 0, avgScore: 0, byDifficulty: {} };
   
-  const results = await db.select().from(followUpHistory)
-    .where(eq(followUpHistory.userId, userId));
+  const results = getAnsweredUniqueFollowUps(
+    await db.select().from(followUpHistory)
+      .where(eq(followUpHistory.userId, userId))
+      .orderBy(desc(followUpHistory.createdAt)),
+  );
   
   if (results.length === 0) {
     return { totalCount: 0, avgScore: 0, byDifficulty: {} };
   }
   
-  const scores = results.filter(r => r.followUpScore !== null).map(r => r.followUpScore as number);
+  const scores = results.map(r => r.followUpScore as number);
   const avgScore = scores.length > 0 ? Math.round(scores.reduce((sum, s) => sum + s, 0) / scores.length) : 0;
   
   // 난이도별 통계
   const byDifficulty: Record<string, { count: number; avgScore: number }> = {};
   ['easy', 'medium', 'hard'].forEach(diff => {
     const diffResults = results.filter(r => r.difficulty === diff);
-    const diffScores = diffResults.filter(r => r.followUpScore !== null).map(r => r.followUpScore as number);
+    const diffScores = diffResults.map(r => r.followUpScore as number);
     byDifficulty[diff] = {
       count: diffResults.length,
       avgScore: diffScores.length > 0 ? Math.round(diffScores.reduce((sum, s) => sum + s, 0) / diffScores.length) : 0,

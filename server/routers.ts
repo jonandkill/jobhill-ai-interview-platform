@@ -4,6 +4,14 @@ import {
   GAME_ASSESSMENT_IDS,
   calculatePracticeScore,
 } from "@shared/gameAssessments";
+import {
+  buildInterviewPlan,
+  getInterviewPhaseById,
+  normalizePreparedQuestions,
+  parseInterviewPlan,
+  serializeInterviewPlan,
+} from "@shared/interviewFramework";
+import { getAnsweredUniqueFollowUps } from "@shared/interviewFollowUps";
 import { PAYMENT_PRODUCTS, type PaymentProductType } from "@shared/products";
 import { getSessionCookieOptions } from "./_core/cookies";
 import { systemRouter } from "./_core/systemRouter";
@@ -68,7 +76,7 @@ const feedbackResponseSchema = z.object({
     structure: z.number().min(0).max(20),
     roleFit: z.number().min(0).max(20),
     clarity: z.number().min(0).max(20),
-  }).optional(),
+  }),
   evidenceQuotes: z.array(z.string().max(300)).max(3).optional().default([]),
   confidenceNote: z.string().max(500).optional(),
 });
@@ -502,10 +510,10 @@ export const appRouter = router({  system: systemRouter,
     start: protectedProcedure
       .input(z.object({
         sessionType: z.enum(["mock_interview", "feedback_only", "voice_interview"]).default("mock_interview"),
-        totalQuestions: z.number().min(1).max(10).default(5),
+        totalQuestions: z.number().int().min(1).max(10).default(5),
         isVoiceMode: z.boolean().default(false),
-        selectedQuestions: z.array(z.string()).optional(), // 사용자가 선택한 질문 목록
-        interviewStages: z.array(z.enum(["basic", "personality", "situational", "strategy", "deep"])).optional(),
+        selectedQuestions: z.array(z.string().trim().min(1).max(1_000)).max(3).optional(),
+        planMode: z.enum(["structured", "selected_only"]).default("structured"),
       }))
       .mutation(async ({ ctx, input }) => {
         // 사용자 정보 조회
@@ -533,16 +541,31 @@ export const appRouter = router({  system: systemRouter,
         
         const profile = await db.getUserProfile(ctx.user.id);
         
+        const preparedQuestions = normalizePreparedQuestions(input.selectedQuestions);
+        let interviewPlan: ReturnType<typeof buildInterviewPlan>;
+        try {
+          interviewPlan = buildInterviewPlan({
+            requestedTotal: input.totalQuestions,
+            preparedQuestions,
+            mode: input.planMode,
+          });
+        } catch (error) {
+          throw new TRPCError({
+            code: "BAD_REQUEST",
+            message: error instanceof Error ? error.message : "면접 질문 순서를 구성할 수 없습니다.",
+          });
+        }
+
         const session = await db.createInterviewSession({
           userId: ctx.user.id,
           profileId: profile?.id,
           sessionType: input.sessionType,
           isVoiceMode: input.isVoiceMode,
           status: "in_progress",
-          totalQuestions: input.selectedQuestions?.length || input.totalQuestions,
+          totalQuestions: interviewPlan.length,
           completedQuestions: 0,
-          selectedQuestions: input.selectedQuestions ? JSON.stringify(input.selectedQuestions) : null,
-          interviewStages: input.interviewStages ? JSON.stringify(input.interviewStages) : JSON.stringify(["basic"]),
+          selectedQuestions: preparedQuestions.length ? JSON.stringify(preparedQuestions) : null,
+          interviewStages: serializeInterviewPlan(interviewPlan),
         });
         
         return session;
@@ -551,8 +574,8 @@ export const appRouter = router({  system: systemRouter,
     // AI 질문 생성
     generateQuestion: protectedProcedure
       .input(z.object({
-        sessionId: z.number(),
-        questionOrder: z.number(),
+        sessionId: z.number().int().positive(),
+        questionOrder: z.number().int().min(0).max(9),
         avatarSpeechStyle: z.object({
           formality: z.enum(['formal', 'semi-formal', 'casual']),
           questionStyle: z.enum(['direct', 'indirect', 'probing', 'friendly']),
@@ -561,72 +584,64 @@ export const appRouter = router({  system: systemRouter,
         }).optional(),
       }))
       .mutation(async ({ ctx, input }) => {
-        const profile = await db.getUserProfile(ctx.user.id);
-        const session = await db.getInterviewSession(input.sessionId);
-        
-        if (!session) throw new Error("세션을 찾을 수 없습니다.");
-        if (session.userId !== ctx.user.id) throw new Error("이 면접 세션에 접근할 수 없습니다.");
-        if (!hasInterviewProfileMaterial(profile)) {
-          throw new Error("맞춤 질문을 만들려면 이력서 또는 자기소개서를 먼저 등록해주세요.");
-        }
-        
-        // 사용자가 선택한 질문이 있으면 해당 질문 사용. 잘못된 JSON이나 빈 문자열은
-        // AI 생성 경로로 보내어 interview_qa.question NOT NULL 오류를 막는다.
-        let selectedQuestions: string[] | null = null;
+        const session = await requireOwnedInterviewSession(ctx.user.id, input.sessionId);
+        let selectedQuestions: string[] = [];
         if (session.selectedQuestions) {
           try {
             const parsed = JSON.parse(session.selectedQuestions as string);
             if (Array.isArray(parsed)) {
-              selectedQuestions = parsed.filter((item): item is string => typeof item === "string");
+              selectedQuestions = normalizePreparedQuestions(
+                parsed.filter((item): item is string => typeof item === "string"),
+              );
             }
           } catch (parseError) {
             console.warn("[generateQuestion] selectedQuestions JSON 파싱 실패:", parseError);
           }
         }
-        // 인덱스 0도 정상 처리되도록 범위와 비어 있지 않음을 함께 확인
-        if (selectedQuestions && input.questionOrder < selectedQuestions.length && selectedQuestions[input.questionOrder]?.trim()) {
-          const selectedQuestion = selectedQuestions[input.questionOrder].trim();
-          const questionType = "personality"; // 기본 타입
-          
+
+        const storedPlan = parseInterviewPlan(session.interviewStages);
+        const interviewPlan = storedPlan ?? buildInterviewPlan({
+          requestedTotal: session.totalQuestions || 5,
+          preparedQuestions: selectedQuestions,
+          mode: selectedQuestions.length > 0 ? "selected_only" : "structured",
+        });
+        const slot = interviewPlan[input.questionOrder];
+        if (!slot) {
+          throw new TRPCError({ code: "BAD_REQUEST", message: "질문 순서가 면접 계획 범위를 벗어났습니다." });
+        }
+        const currentPhase = getInterviewPhaseById(slot.phaseId);
+
+        if (slot.source === "prepared") {
+          const selectedQuestion = selectedQuestions[slot.preparedQuestionIndex ?? -1];
+          if (!selectedQuestion) {
+            throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "저장된 사전 질문 구성이 올바르지 않습니다." });
+          }
           const qa = await db.createInterviewQA({
             sessionId: input.sessionId,
             questionOrder: input.questionOrder,
-            questionType,
+            questionType: currentPhase.questionType,
             question: selectedQuestion,
           });
-          
-          return { id: qa.id, question: selectedQuestion, questionType };
+          return {
+            ...qa,
+            phaseId: currentPhase.id,
+            phaseLabel: currentPhase.label,
+            timingInfo: { timing: "사전 질문 파트", mood: "필수 질문 확인", answerStyle: "질문의 조건에 직접 답변" },
+          };
+        }
+
+        const profile = await db.getUserProfile(ctx.user.id);
+        if (!hasInterviewProfileMaterial(profile)) {
+          throw new Error("맞춤 질문을 만들려면 이력서 또는 자기소개서를 먼저 등록해주세요.");
         }
         
         const existingQAs = await db.getSessionQAs(input.sessionId);
         const previousQuestions = existingQAs.map(qa => qa.question).join("\n");
-        
-        // 세션에 저장된 선택 면접 단계 파싱 (기본값 ["basic"])
-        let activeStages: string[] = ["basic"];
-        if (session.interviewStages) {
-          try {
-            const parsed = JSON.parse(session.interviewStages as string);
-            if (Array.isArray(parsed) && parsed.length > 0) {
-              activeStages = parsed;
-            }
-          } catch (e) {
-            // 무시하고 기본값 사용
-          }
-        }
-        
-        // questionOrder에 따라 activeStages에서 순차적으로 단계 선택
-        const currentStageId = activeStages[input.questionOrder % activeStages.length];
-        
-        // 단계별 매핑 정의 (대한민국 AI 역량검사 5단계 기준)
-        const stageTypeMap: Record<string, "personality" | "experience" | "technical" | "situational" | "company"> = {
-          basic: "experience",       // 1단계 기본 면접 (자기소개, 지원동기, 장단점)
-          personality: "personality", // 2단계 성향 파악 (가치관, 직무 성향)
-          situational: "situational", // 3단계 상황 대처 (롤플레잉형 업무 상황)
-          strategy: "technical",      // 4단계 전략 게임 / 구조화 역량 평가
-          deep: "company"             // 5단계 심층 면접 (답변 기반 꼬리 질문)
-        };
-        
-        const questionType = stageTypeMap[currentStageId] || "personality";
+        const previousContext = existingQAs
+          .filter(qa => qa.userAnswer)
+          .map(qa => `질문: ${limitPromptText(qa.question, 500)}\n답변: ${limitPromptText(qa.userAnswer, 800)}`)
+          .join("\n\n");
+        const questionType = currentPhase.questionType;
         
         const typeNames: Record<string, string> = {
           personality: "인성/성격",
@@ -684,19 +699,11 @@ export const appRouter = router({  system: systemRouter,
         const styleReminder = speechStyle
           ? "중요: 질문을 작성할 때 위의 면접관 말투 스타일을 반드시 반영해주세요."
           : "";
-        // 대한민국 AI 역량검사 5단계별 특화 가이드
-        const stageGuideMap: Record<string, string> = {
-          basic: "1단계 기본 면접: 지원자의 첫인상, 자기소개, 지원동기, 성격의 장단점을 확인하는 기본 역량 검사입니다.",
-          personality: "2단계 성향 파악: 지원자의 가치관, 직무 적합도, 조직 적응력을 평가하는 인성/성향 검사 문항 스타일입니다.",
-          situational: "3단계 상황 대처: 롤플레잉형 면접으로, 업무 중 발생할 수 있는 난처한 상황(상사와의 갈등, 마감 임박 실수 등)을 가정하여 직접 대사하듯 답변하도록 유도하는 질문입니다.",
-          strategy: "4단계 전략 게임 및 구조화 역량 평가: 논리적 추론, 문제 해결 패턴, 계획성 및 집중력을 측정하는 구조화된 전문 역량 검사 질문입니다.",
-          deep: "5단계 심층 면접: 앞선 답변이나 지원자의 이력서 핵심 키워드를 깊이 파고드는 꼬리 질문(Deep Question)입니다."
-        };
-        const stageInstruction = stageGuideMap[currentStageId] || stageGuideMap.basic;
+        const stageInstruction = `${currentPhase.label}: ${currentPhase.purpose}. ${currentPhase.promptGuide}`;
 
         const prompt = [
           `당신은 ${profile?.targetCompany || "기업"}의 ${profile?.targetPosition || "직무"} 면접관입니다.`,
-          `현재 진행 중인 AI 역량검사 단계: ${stageInstruction}`,
+          `현재 면접 파트: ${stageInstruction}`,
           speechStyleGuide,
           "지원자 정보:",
           `- 이력서: ${limitPromptText(profile?.resume)}`,
@@ -706,6 +713,7 @@ export const appRouter = router({  system: systemRouter,
           `- 보유 기술: ${limitPromptText(profile?.skills, 1200)}`,
           "",
           `이전에 한 질문들 (중복 피하기):\n${previousQuestions || "없음"}`,
+          `이전 답변 맥락 (실제로 답한 내용만 사용):\n${previousContext || "없음"}`,
           `${typeNames[questionType]} 유형이자 "${stageInstruction}" 목적에 정확히 부합하는 면접 질문을 1개 생성해주세요.`,
           "중요 요구사항:",
           "1. 질문은 1~2문장, 최대 80자 이내로 간결하게 작성하세요.",
@@ -765,6 +773,8 @@ export const appRouter = router({  system: systemRouter,
         // 질문과 연습 흐름에 필요한 타이밍 정보만 반환합니다.
         return {
           ...qa,
+          phaseId: currentPhase.id,
+          phaseLabel: currentPhase.label,
           timingInfo: timingInfo,
         };
       }),
@@ -995,7 +1005,7 @@ ${avatarStyle ? `문체만 위의 면접관 피드백 스타일을 반영하고 
     
     // 면접 완료 및 전체 피드백
     complete: protectedProcedure
-      .input(z.object({ sessionId: z.number() }))
+      .input(z.object({ sessionId: z.number().int().positive() }))
       .mutation(async ({ ctx, input }) => {
         const session = await requireOwnedInterviewSession(ctx.user.id, input.sessionId);
         try {
@@ -1012,7 +1022,7 @@ ${avatarStyle ? `문체만 위의 면접관 피드백 스타일을 반영하고 
               session: { ...session, balanceAnalysis: storedBalance },
               qas,
               balanceData: [],
-              followUpStats: await db.getFollowUpStatsBySession(input.sessionId),
+              followUpStats: await db.getFollowUpStatsBySession(ctx.user.id, input.sessionId),
             };
           }
           
@@ -1040,8 +1050,10 @@ ${avatarStyle ? `문체만 위의 면접관 피드백 스타일을 반영하고 
           }
         
         // 꼬리질문 통계 가져오기
-        const followUpHistory = await db.getFollowUpHistoryBySession(input.sessionId);
-        const followUpCount = followUpHistory?.length || 0;
+        const followUpHistory = getAnsweredUniqueFollowUps(
+          await db.getFollowUpHistoryBySession(ctx.user.id, input.sessionId),
+        );
+        const followUpCount = followUpHistory.length;
         const followUpAvgScore = followUpCount > 0
           ? Math.round(followUpHistory.reduce((sum: number, fh: any) => sum + (fh.followUpScore || 0), 0) / followUpCount)
           : 0;
@@ -1205,7 +1217,7 @@ JSON 형식으로 다음을 제공해주세요:
           },
           qas,
           balanceData,
-          followUpStats: await db.getFollowUpStatsBySession(input.sessionId),
+          followUpStats: await db.getFollowUpStatsBySession(ctx.user.id, input.sessionId),
         };
         } catch (error) {
           console.error("면접 완료 처리 오류:", error);
@@ -1508,14 +1520,17 @@ JSON 형식으로 다음을 제공해주세요:
     // 후속 질문 히스토리 저장
     saveFollowUpHistory: protectedProcedure
       .input(z.object({
-        sessionId: z.number().optional(),
-        originalQuestion: z.string(),
-        userAnswer: z.string(),
-        followUpQuestion: z.string(),
+        sessionId: z.number().int().positive().optional(),
+        originalQuestion: z.string().trim().min(1).max(1_000),
+        userAnswer: z.string().trim().max(12_000),
+        followUpQuestion: z.string().trim().min(1).max(1_000),
         difficulty: z.enum(['easy', 'medium', 'hard']).optional().default('medium'),
-        depth: z.number().optional().default(1),
+        depth: z.number().int().min(1).max(10).optional().default(1),
       }))
       .mutation(async ({ ctx, input }) => {
+        if (input.sessionId !== undefined) {
+          await requireOwnedInterviewSession(ctx.user.id, input.sessionId);
+        }
         return db.createFollowUpHistory({
           userId: ctx.user.id,
           sessionId: input.sessionId,

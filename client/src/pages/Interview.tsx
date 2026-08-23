@@ -88,6 +88,11 @@ import { Link, useLocation } from "wouter";
 import { Streamdown } from "streamdown";
 import { correctSpeechText, generateSpeechHintMessage } from "@/lib/speechDictionary";
 import { escapeHtml, escapeHtmlWithBreaks } from "@/lib/safeHtml";
+import {
+  INTERVIEW_PHASES,
+  type InterviewPhaseId,
+  type InterviewRubricScores,
+} from "@shared/interviewFramework";
 
 type SessionStatus = "idle" | "starting" | "in_progress" | "answering" | "feedback" | "completed";
 
@@ -104,6 +109,9 @@ interface QAItem {
   userAnswer?: string | null;
   feedback?: string | null;
   score?: number | null;
+  phaseId?: InterviewPhaseId | null;
+  phaseLabel?: string | null;
+  rubricScores?: InterviewRubricScores | null;
   strengths?: string | null;
   improvements?: string | null;
   suggestedAnswer?: string | null;
@@ -257,7 +265,7 @@ export default function Interview() {
   const [questionGenerationError, setQuestionGenerationError] = useState<string | null>(null);
   const [wizardCompany, setWizardCompany] = useState("");
   const [wizardPosition, setWizardPosition] = useState("");
-  const [selectedInterviewStages, setSelectedInterviewStages] = useState<Array<"basic" | "personality" | "situational" | "strategy" | "deep">>(["basic", "personality", "situational", "strategy", "deep"]);
+  const [planMode, setPlanMode] = useState<"structured" | "selected_only">("structured");
   const [recordingMode, setRecordingMode] = useState<"manual" | "automatic">("manual");
   const [silenceThreshold, setSilenceThreshold] = useState(3);
   const questionGenerationTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -646,6 +654,7 @@ export default function Interview() {
           if (retryData && retryData.question) {
             setSelectedQuestions([retryData.question]);
             setTotalQuestions(1);
+            setPlanMode("selected_only");
             setSetupStep(6); // 바로 준비 완료 단계로 이동
             toast.success(`"${retryData.question.slice(0, 20)}..." 재연습을 시작합니다!`);
           }
@@ -1632,10 +1641,7 @@ export default function Interview() {
   const startMutation = trpc.interview.start.useMutation({
     onSuccess: (data) => {
       setSessionId(data.id);
-      // 선택된 질문이 있으면 해당 개수로 totalQuestions 업데이트
-      if (selectedQuestions.length > 0) {
-        setTotalQuestions(selectedQuestions.length);
-      }
+      setTotalQuestions(data.totalQuestions || totalQuestions);
       setStatus("in_progress");
       generateQuestion(data.id, 0);
     },
@@ -1658,6 +1664,8 @@ export default function Interview() {
         id: data.id,
         question: data.question,
         questionType: data.questionType || "personality",
+        phaseId: data.phaseId,
+        phaseLabel: data.phaseLabel,
       };
       setCurrentQA(qa);
       setStatus("answering");
@@ -1684,7 +1692,6 @@ export default function Interview() {
     },
   });
 
-  const saveFollowUpMutation = trpc.interview.saveFollowUpHistory.useMutation();
   const logTTSErrorMutation = trpc.ttsMonitoring.logError.useMutation();
   
   const submitMutation = trpc.interview.submitAnswer.useMutation({
@@ -1694,6 +1701,7 @@ export default function Interview() {
         userAnswer: data.userAnswer,
         feedback: data.feedback,
         score: data.score,
+        rubricScores: data.rubricScores,
         strengths: data.strengths,
         improvements: data.improvements,
         suggestedAnswer: data.suggestedAnswer,
@@ -1715,20 +1723,6 @@ export default function Interview() {
         setAvatarEmotion(getEmotionByScore(data.score));
       }
       
-      // 후속 질문 히스토리 저장 (후속 질문이 있을 때만)
-      if (data.followUpQuestions && data.followUpQuestions.length > 0) {
-        data.followUpQuestions.forEach((fq: string, idx: number) => {
-          saveFollowUpMutation.mutate({
-            sessionId: sessionId || undefined,
-            originalQuestion: currentQA?.question || '',
-            userAnswer: data.userAnswer || '',
-            followUpQuestion: fq,
-            difficulty: followUpDifficulty,
-            depth: followUpCount + 1,
-          });
-        });
-      }
-      
       // 꼬리 질문 연속 모드일 때 자동으로 첫 번째 후속 질문으로 진행
       if (continuousFollowUpMode && followUpCount < maxFollowUpCount && data.followUpQuestions && data.followUpQuestions.length > 0) {
         setTimeout(() => {
@@ -1740,8 +1734,6 @@ export default function Interview() {
           });
           setAnswer('');
           setStatus('answering');
-          setQuestionIndex(prev => prev + 1);
-          setTotalQuestions(prev => prev + 1);
           setFollowUpCount(prev => prev + 1);
           
           toast.info(`꼬리 질문 연속 모드: ${followUpCount + 1}/${maxFollowUpCount}회`, {
@@ -1957,10 +1949,10 @@ export default function Interview() {
     setStatus("starting");
     startMutation.mutate({
       sessionType: "mock_interview",
-      totalQuestions: selectedQuestions.length > 0 ? selectedQuestions.length : totalQuestions,
+      totalQuestions,
       isVoiceMode: voiceMode,
       selectedQuestions: selectedQuestions.length > 0 ? selectedQuestions : undefined,
-      interviewStages: selectedInterviewStages,
+      planMode,
     });
   };
 
@@ -2123,23 +2115,19 @@ export default function Interview() {
 
                 {setupStep === 2 && (
                   <div className="space-y-5">
-                    <div><h2 className="text-xl font-semibold">어떤 면접을 연습할까요?</h2><p className="mt-2 text-sm leading-6 text-muted-foreground">필요한 단계만 선택하세요. 선택한 단계의 질문과 결과가 순서대로 진행됩니다.</p></div>
+                    <div><h2 className="text-xl font-semibold">면접 질문 순서</h2><p className="mt-2 text-sm leading-6 text-muted-foreground">실제 구조화 면접 흐름을 따라 아래 순서로 진행합니다. 질문 수가 적으면 핵심 파트로 축약됩니다.</p></div>
                     <div className="grid gap-3">
-                      {([
-                        ["basic", "1단계 기본 면접", "자기소개·지원동기·장단점"],
-                        ["personality", "2단계 성향 파악", "가치관과 직무 성향 문항"],
-                        ["situational", "3단계 상황 대처", "롤플레잉형 업무 상황"],
-                        ["strategy", "4단계 전략 게임", "집중력·기억력·문제 해결"],
-                        ["deep", "5단계 심층 면접", "답변 기반 꼬리 질문"],
-                      ] as const).map(([id, title, description]) => {
-                        const selected = selectedInterviewStages.includes(id);
-                        return <button key={id} type="button" className={`rounded-xl border p-4 text-left ${selected ? "border-primary bg-primary/5" : "hover:border-primary/50"}`} onClick={() => setSelectedInterviewStages((previous) => selected ? (previous.length > 1 ? previous.filter((item) => item !== id) : previous) : [...previous, id])}>
-                          <div className="flex items-start gap-3"><div className={`mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded border ${selected ? "border-primary bg-primary text-primary-foreground" : "border-muted-foreground"}`}>{selected && <CheckCircle2 className="h-4 w-4" />}</div><div><p className="font-medium">{title}</p><p className="mt-1 text-sm text-muted-foreground">{description}</p></div></div>
-                        </button>;
-                      })}
+                      {INTERVIEW_PHASES.map((phase, index) => (
+                        <div key={phase.id} className="rounded-xl border bg-muted/20 p-4">
+                          <div className="flex items-start gap-3">
+                            <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-primary text-xs font-bold text-primary-foreground">{index + 1}</div>
+                            <div><p className="font-medium">{phase.label}</p><p className="mt-1 text-sm text-muted-foreground">{phase.purpose}</p></div>
+                          </div>
+                        </div>
+                      ))}
                     </div>
-                    <p className="text-xs text-muted-foreground">기본 면접은 항상 하나 이상 선택해야 합니다. 성향·게임 단계는 준비 시간이 더 필요할 수 있습니다.</p>
-                    <Button className="w-full" onClick={() => moveSetupStep(1)}>면접 단계 저장 후 다음</Button>
+                    <p className="text-xs text-muted-foreground">사전 질문을 선택한 경우에도 전체 면접을 대체하지 않고 ‘사전 질문지’ 파트에 삽입됩니다.</p>
+                    <Button className="w-full" onClick={() => moveSetupStep(1)}>질문 순서 확인 후 다음</Button>
                   </div>
                 )}
 
@@ -2167,7 +2155,7 @@ export default function Interview() {
                 {setupStep === 5 && (
                   <div className="space-y-5">
                     <div><h2 className="text-xl font-semibold">면접 분량과 녹음 방식을 정해주세요</h2><p className="mt-2 text-sm leading-6 text-muted-foreground">질문 수와 답변 시간을 정합니다. 이력서·자소서 맞춤 질문은 면접 시작 후 한 개씩 생성됩니다.</p></div>
-                    <div><p className="mb-2 text-sm font-medium">질문 수</p><div className="grid grid-cols-3 gap-2">{[5, 7, 10].map((count) => <Button key={count} type="button" variant={totalQuestions === count ? "default" : "outline"} onClick={() => setTotalQuestions(count)}>{count}개</Button>)}</div></div>
+                    <div><p className="mb-2 text-sm font-medium">질문 수</p><div className="grid grid-cols-3 gap-2">{[5, 8, 10].map((count) => <Button key={count} type="button" variant={totalQuestions === count ? "default" : "outline"} onClick={() => setTotalQuestions(count)}>{count}개</Button>)}</div><p className="mt-2 text-xs text-muted-foreground">5문항은 핵심 축약, 8문항은 전체 8개 파트를 한 번씩 연습합니다.</p></div>
                     <div><p className="mb-2 text-sm font-medium">질문당 답변 시간</p><div className="grid grid-cols-3 gap-2">{[60, 90, 120].map((seconds) => <Button key={seconds} type="button" variant={timerDuration === seconds ? "default" : "outline"} onClick={() => setTimerDuration(seconds)}>{seconds / 60}분</Button>)}</div></div>
                     {voiceMode && <>
                       <div><p className="mb-2 text-sm font-medium">녹음 방식</p><div className="grid gap-2 sm:grid-cols-2"><button type="button" className={`rounded-lg border p-3 text-left ${recordingMode === "manual" ? "border-primary bg-primary/5" : "hover:border-primary/50"}`} onClick={() => setRecordingMode("manual")}><p className="font-medium">수동 녹음</p><p className="mt-1 text-xs text-muted-foreground">마이크 버튼을 눌러 시작·종료</p></button><button type="button" className={`rounded-lg border p-3 text-left ${recordingMode === "automatic" ? "border-primary bg-primary/5" : "hover:border-primary/50"}`} onClick={() => setRecordingMode("automatic")}><p className="font-medium">자동 녹음</p><p className="mt-1 text-xs text-muted-foreground">질문 재생 후 자동 시작</p></button></div></div>
@@ -2196,7 +2184,7 @@ export default function Interview() {
                 {setupStep === 6 && (
                   <div className="space-y-5">
                     <div><h2 className="text-xl font-semibold">준비가 끝났습니다</h2><p className="mt-2 text-sm leading-6 text-muted-foreground">시작하기를 누르면 질문을 한 개씩 준비합니다. 질문이 늦어져도 재시도하거나 설정으로 돌아갈 수 있습니다.</p></div>
-                    <div className="space-y-2 rounded-lg bg-muted/40 p-4 text-sm"><p>지원 정보: <span className="font-medium">{wizardCompany} · {wizardPosition}</span></p><p>선택 단계: <span className="font-medium">{selectedInterviewStages.length}개</span></p><p>면접 방식: <span className="font-medium">{voiceMode ? "음성" : "텍스트"}</span></p><p>면접관: <span className="font-medium">{selectedAvatar.name}</span></p><p>분량: <span className="font-medium">{totalQuestions}문항 · {timerDuration / 60}분</span></p>{voiceMode && <p>녹음: <span className="font-medium">{recordingMode === "automatic" ? `자동 · ${silenceThreshold}초 침묵 감지` : "수동"}</span></p>}</div>
+                    <div className="space-y-2 rounded-lg bg-muted/40 p-4 text-sm"><p>지원 정보: <span className="font-medium">{wizardCompany} · {wizardPosition}</span></p><p>질문 흐름: <span className="font-medium">{planMode === "selected_only" ? "선택 질문 1개 재연습" : "구조화 면접 8단계"}</span></p><p>사전 질문: <span className="font-medium">{selectedQuestions.length}개</span></p><p>면접 방식: <span className="font-medium">{voiceMode ? "음성" : "텍스트"}</span></p><p>면접관: <span className="font-medium">{selectedAvatar.name}</span></p><p>기본 분량: <span className="font-medium">{totalQuestions}문항 · {timerDuration / 60}분</span></p>{voiceMode && <p>녹음: <span className="font-medium">{recordingMode === "automatic" ? `자동 · ${silenceThreshold}초 침묵 감지` : "수동"}</span></p>}</div>
                     {voiceMode && (
                       <div className="space-y-3">
                         <div className="flex items-center justify-between gap-4 rounded-lg border p-3">
@@ -2539,7 +2527,7 @@ export default function Interview() {
 
           {/* 대표 질문 추천 */}
           <PopularQuestions 
-            maxSelections={10}
+            maxSelections={3}
             hasProfile={!!(profile?.resume || profile?.coverLetter)}
             profileResume={profile?.resume}
             profileCoverLetter={profile?.coverLetter}
@@ -2585,15 +2573,17 @@ export default function Interview() {
               
               // 선택된 질문 상태 업데이트 및 면접 시작
               setSelectedQuestions(questions);
-              setTotalQuestions(questions.length);
+              setPlanMode("structured");
+              setTotalQuestions(5);
               setStatus("starting");
               startMutation.mutate({
                 sessionType: "mock_interview",
-                totalQuestions: questions.length,
+                totalQuestions: 5,
                 isVoiceMode: voiceMode,
                 selectedQuestions: questions,
+                planMode: "structured",
               });
-              toast.success(`${questions.length}개 질문으로 면접을 시작합니다!`);
+              toast.success(`사전 질문 ${questions.length}개를 포함한 구조화 면접을 시작합니다!`);
             }}
           />
           
@@ -3735,6 +3725,7 @@ export default function Interview() {
               <div className="flex items-center gap-2 text-sm text-muted-foreground">
                 <MessageSquare className="w-4 h-4" />
                 <span>{getQuestionTypeLabel(currentQA?.questionType || "")}</span>
+                {currentQA?.phaseLabel && <Badge variant="outline">{currentQA.phaseLabel}</Badge>}
               </div>
               
               {/* 타이머 설정 - 모바일에서 줄바꿈 */}
@@ -4730,7 +4721,7 @@ export default function Interview() {
               </CardContent>
             </Card>
 
-            <InterviewCheckpoint answers={qas} />
+            <InterviewCheckpoint answers={qas.filter(item => item.questionType !== "follow_up")} />
 
             {/* 추가 기능 버튼 */}
             <div className="flex flex-wrap justify-center gap-2 mb-4">

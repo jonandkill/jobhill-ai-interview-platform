@@ -16,6 +16,42 @@ export interface InterviewPhase {
   promptGuide: string;
 }
 
+export const INTERVIEW_RUBRIC_KEYS = [
+  "relevance",
+  "evidence",
+  "structure",
+  "roleFit",
+  "clarity",
+] as const;
+export type InterviewRubricKey = (typeof INTERVIEW_RUBRIC_KEYS)[number];
+export type InterviewRubricScores = Record<InterviewRubricKey, number>;
+
+export const INTERVIEW_RUBRIC_GUIDE: Record<InterviewRubricKey, {
+  label: string;
+  nextAction: string;
+}> = {
+  relevance: {
+    label: "질문 관련성",
+    nextAction: "첫 문장에서 질문에 직접 답하고, 그 결론을 뒷받침하는 근거 1개를 제시하세요.",
+  },
+  evidence: {
+    label: "근거 구체성",
+    nextAction: "본인 역할 → 실제 행동 → 확인 가능한 결과를 각각 한 문장으로 설명하세요.",
+  },
+  structure: {
+    label: "답변 구조",
+    nextAction: "결론 → 상황·과제 → 행동 → 결과 순서로 답변을 다시 구성하세요.",
+  },
+  roleFit: {
+    label: "직무 연결",
+    nextAction: "경험을 지원 직무의 실제 업무나 판단 기준 하나와 연결하세요.",
+  },
+  clarity: {
+    label: "명료성",
+    nextAction: "한 문장에는 한 메시지만 두고 반복 표현을 제거해 60~90초로 정리하세요.",
+  },
+};
+
 export const INTERVIEW_PHASES: InterviewPhase[] = [
   {
     id: "basic",
@@ -75,6 +111,37 @@ export const INTERVIEW_PHASES: InterviewPhase[] = [
   },
 ];
 
+export const INTERVIEW_PHASE_IDS = INTERVIEW_PHASES.map(phase => phase.id) as InterviewPhaseId[];
+
+export function getInterviewPhaseById(id: InterviewPhaseId): InterviewPhase {
+  return INTERVIEW_PHASES.find(phase => phase.id === id) ?? INTERVIEW_PHASES[0];
+}
+
+export type InterviewQuestionSource = "generated" | "prepared";
+
+export interface InterviewPlanSlot {
+  order: number;
+  phaseId: InterviewPhaseId;
+  questionType: InterviewPhase["questionType"];
+  source: InterviewQuestionSource;
+  preparedQuestionIndex?: number;
+}
+
+export interface BuildInterviewPlanInput {
+  requestedTotal: number;
+  preparedQuestions?: readonly string[];
+  mode?: "structured" | "selected_only";
+}
+
+export function normalizePreparedQuestions(questions: readonly string[] = []): string[] {
+  return Array.from(new Set(
+    questions
+      .map(question => question.trim())
+      .filter(Boolean)
+      .map(question => question.slice(0, 1_000)),
+  ));
+}
+
 const SHORT_SESSION_PHASES: Record<number, InterviewPhaseId[]> = {
   1: ["resume"],
   2: ["basic", "fit"],
@@ -91,6 +158,145 @@ export function getInterviewPhase(questionOrder: number, totalQuestions: number)
   const ids = SHORT_SESSION_PHASES[safeTotal] ?? INTERVIEW_PHASES.map((phase) => phase.id);
   const id = ids[safeOrder % ids.length];
   return INTERVIEW_PHASES.find((phase) => phase.id === id) ?? INTERVIEW_PHASES[0];
+}
+
+export function buildInterviewPlan({
+  requestedTotal,
+  preparedQuestions = [],
+  mode = "structured",
+}: BuildInterviewPlanInput): InterviewPlanSlot[] {
+  const prepared = normalizePreparedQuestions(preparedQuestions);
+
+  if (mode === "selected_only") {
+    if (prepared.length === 0) throw new RangeError("선택 질문 재연습에는 질문이 필요합니다.");
+    if (prepared.length > 10) throw new RangeError("전체 질문은 최대 10개입니다.");
+    return prepared.map((_, order) => ({
+      order,
+      phaseId: "prepared",
+      questionType: getInterviewPhaseById("prepared").questionType,
+      source: "prepared",
+      preparedQuestionIndex: order,
+    }));
+  }
+
+  const requested = Math.max(1, Math.min(10, Math.round(requestedTotal || 5)));
+  const phaseIds: InterviewPhaseId[] = requested >= 8
+    ? [
+        ...INTERVIEW_PHASE_IDS,
+        ...(["resume", "highlight"].slice(0, requested - 8) as InterviewPhaseId[]),
+      ]
+    : Array.from({ length: requested }, (_, order) => getInterviewPhase(order, requested).id);
+
+  const slots: InterviewPlanSlot[] = phaseIds.map((phaseId, order) => ({
+    order,
+    phaseId,
+    questionType: getInterviewPhaseById(phaseId).questionType,
+    source: "generated",
+  }));
+
+  if (prepared.length > 0) {
+    let preparedIndex = slots.findIndex(slot => slot.phaseId === "prepared");
+    if (preparedIndex < 0) {
+      const basicIndex = slots.findIndex(slot => slot.phaseId === "basic");
+      preparedIndex = basicIndex >= 0 ? basicIndex + 1 : 0;
+      slots.splice(preparedIndex, 0, {
+        order: preparedIndex,
+        phaseId: "prepared",
+        questionType: getInterviewPhaseById("prepared").questionType,
+        source: "generated",
+      });
+    }
+    slots.splice(
+      preparedIndex,
+      1,
+      ...prepared.map((_, index) => ({
+        order: preparedIndex + index,
+        phaseId: "prepared" as const,
+        questionType: getInterviewPhaseById("prepared").questionType,
+        source: "prepared" as const,
+        preparedQuestionIndex: index,
+      })),
+    );
+  }
+
+  if (slots.length > 10) {
+    throw new RangeError("사전 질문을 포함한 전체 질문은 최대 10개입니다. 질문 수를 줄여주세요.");
+  }
+  return slots.map((slot, order) => ({ ...slot, order }));
+}
+
+export function serializeInterviewPlan(plan: readonly InterviewPlanSlot[]): string {
+  return JSON.stringify({ version: 1, slots: plan });
+}
+
+export function parseInterviewPlan(value: unknown): InterviewPlanSlot[] | null {
+  let parsed = value;
+  if (typeof parsed === "string") {
+    try {
+      parsed = JSON.parse(parsed);
+    } catch {
+      return null;
+    }
+  }
+  if (!parsed || typeof parsed !== "object") return null;
+  const candidate = parsed as { version?: unknown; slots?: unknown };
+  if (candidate.version !== 1 || !Array.isArray(candidate.slots) || candidate.slots.length === 0 || candidate.slots.length > 10) {
+    return null;
+  }
+  const slots: InterviewPlanSlot[] = [];
+  for (let order = 0; order < candidate.slots.length; order += 1) {
+    const raw = candidate.slots[order] as Partial<InterviewPlanSlot>;
+    if (
+      raw.order !== order ||
+      !INTERVIEW_PHASE_IDS.includes(raw.phaseId as InterviewPhaseId) ||
+      (raw.source !== "generated" && raw.source !== "prepared")
+    ) return null;
+    if (raw.source === "prepared" && (!Number.isInteger(raw.preparedQuestionIndex) || (raw.preparedQuestionIndex ?? -1) < 0)) {
+      return null;
+    }
+    const phase = getInterviewPhaseById(raw.phaseId as InterviewPhaseId);
+    slots.push({
+      order,
+      phaseId: phase.id,
+      questionType: phase.questionType,
+      source: raw.source,
+      ...(raw.source === "prepared" ? { preparedQuestionIndex: raw.preparedQuestionIndex } : {}),
+    });
+  }
+  return slots;
+}
+
+export function summarizeRubricCheckpoint(
+  attempts: Array<{ rubricScores?: InterviewRubricScores | null }>,
+) {
+  const latest = attempts.slice(-3);
+  const complete = latest.filter(attempt =>
+    attempt.rubricScores &&
+    INTERVIEW_RUBRIC_KEYS.every(key => Number.isFinite(attempt.rubricScores?.[key])),
+  );
+  if (latest.length < 3 || complete.length < 3) {
+    return { insufficientData: true as const, averages: null, weakest: null };
+  }
+  const averages = Object.fromEntries(
+    INTERVIEW_RUBRIC_KEYS.map(key => [
+      key,
+      Math.round(
+        complete.reduce((sum, attempt) => sum + (attempt.rubricScores?.[key] ?? 0), 0) / complete.length * 10,
+      ) / 10,
+    ]),
+  ) as InterviewRubricScores;
+  const weakestKey = INTERVIEW_RUBRIC_KEYS.reduce((lowest, key) =>
+    averages[key] < averages[lowest] ? key : lowest,
+  );
+  return {
+    insufficientData: false as const,
+    averages,
+    weakest: {
+      key: weakestKey,
+      score: averages[weakestKey],
+      ...INTERVIEW_RUBRIC_GUIDE[weakestKey],
+    },
+  };
 }
 
 export const EMPHASIS_AXES = [
@@ -126,4 +332,3 @@ export function analyzeAnswerEmphasis(answers: string[]) {
     missing: weighted.filter((item) => item.count === 0).map((item) => item.label),
   };
 }
-
