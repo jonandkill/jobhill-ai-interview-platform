@@ -16,7 +16,8 @@ interface ShapeRotationGameProps {
 }
 
 const generateRandomShape = (): Shape => {
-  const types: Shape['type'][] = ['triangle', 'square', 'pentagon'];
+  // 정사각형은 90도 회전 전후가 같아 문항으로 성립하지 않으므로 제외합니다.
+  const types: Shape['type'][] = ['triangle', 'pentagon'];
   const rotations = [0, 90, 180, 270];
   
   const type = types[Math.floor(Math.random() * types.length)];
@@ -71,7 +72,7 @@ export default function ShapeRotationGame({ onComplete, duration = 45 }: ShapeRo
       setTimeLeft(prev => {
         if (prev <= 1) {
           setIsPlaying(false);
-          onComplete(score);
+          onComplete(Math.max(0, Math.min(100, score)));
           return 0;
         }
         return prev - 1;
@@ -106,7 +107,7 @@ export default function ShapeRotationGame({ onComplete, duration = 45 }: ShapeRo
     setFeedback(isCorrect ? 'correct' : 'wrong');
     
     if (isCorrect) {
-      setScore(prev => prev + 15);
+      setScore(prev => Math.min(100, prev + 15));
     } else {
       setScore(prev => Math.max(0, prev - 5));
     }
@@ -143,7 +144,7 @@ export default function ShapeRotationGame({ onComplete, duration = 45 }: ShapeRo
       <CardHeader>
         <CardTitle className="flex items-center gap-2">
           <RotateCw className="w-5 h-5 text-blue-500" />
-          공간 지각력 테스트 - 도형 회전
+          도형 비교 연습 - 회전
         </CardTitle>
         <CardDescription>
           {isPlaying ? (
@@ -160,7 +161,7 @@ export default function ShapeRotationGame({ onComplete, duration = 45 }: ShapeRo
         {!isPlaying && timeLeft === duration ? (
           <div className="text-center py-8">
             <Trophy className="w-16 h-16 text-blue-500 mx-auto mb-4" />
-            <p className="text-lg mb-4">공간 지각력과 패턴 인식 능력을 테스트합니다</p>
+            <p className="text-lg mb-4">이번 연습에서 도형 회전 비교의 정확도를 확인합니다</p>
             <p className="text-sm text-muted-foreground mb-6">
               도형을 회전시켜 목표 각도에 정확히 맞추세요!
             </p>
@@ -186,7 +187,7 @@ export default function ShapeRotationGame({ onComplete, duration = 45 }: ShapeRo
               <p className="text-sm text-muted-foreground mb-4">목표 각도</p>
               <div className="inline-block p-4 bg-secondary/20 rounded-lg mb-6">
                 <ShapeDisplay type={shape.type} rotation={shape.targetRotation} />
-                <p className="text-xs text-muted-foreground mt-2">{shape.targetRotation}°</p>
+                <span className="sr-only">비교할 목표 도형</span>
               </div>
             </div>
 
@@ -200,7 +201,7 @@ export default function ShapeRotationGame({ onComplete, duration = 45 }: ShapeRo
               <p className="text-sm text-muted-foreground mb-4">현재 도형 (회전시키세요)</p>
               <div className="inline-block p-4 bg-primary/10 rounded-lg mb-4 relative">
                 <ShapeDisplay type={shape.type} rotation={shape.rotation} />
-                <p className="text-xs text-muted-foreground mt-2">{shape.rotation}°</p>
+                <span className="sr-only">현재 회전 도형</span>
                 
                 {feedback && (
                   <div className="absolute inset-0 flex items-center justify-center bg-black/50 rounded-lg">

@@ -178,9 +178,9 @@ export default function NumberClickGame({ onComplete, onRestart }: NumberClickGa
           <div className="p-4 bg-blue-500/10 border border-blue-500/30 rounded-lg">
             <p className="text-sm font-medium text-blue-500 mb-2">평가 결과</p>
             <p className="text-sm text-muted-foreground">
-              {finalScore >= 80 ? "🎉 우수한 집중력과 순발력을 보여주셨습니다!" :
-               finalScore >= 60 ? "👍 양호한 수준입니다. 조금 더 연습하면 더 좋은 결과를 얻을 수 있습니다." :
-               "💪 연습을 통해 집중력을 향상시켜보세요!"}
+              {finalScore >= 80 ? "이번 시도에서는 숫자 순서를 안정적으로 찾았습니다." :
+               finalScore >= 60 ? "이번 시도에는 일부 오클릭이나 탐색 지연이 있었습니다." :
+               "왼쪽부터 구역을 나눠 일정한 순서로 탐색해보세요."}
             </p>
           </div>
 

@@ -1,4 +1,9 @@
 import { COOKIE_NAME } from "@shared/const";
+import {
+  GAME_ASSESSMENT_BY_ID,
+  GAME_ASSESSMENT_IDS,
+  calculatePracticeScore,
+} from "@shared/gameAssessments";
 import { PAYMENT_PRODUCTS, type PaymentProductType } from "@shared/products";
 import { getSessionCookieOptions } from "./_core/cookies";
 import { systemRouter } from "./_core/systemRouter";
@@ -87,6 +92,17 @@ const revisionFeedbackSchema = z.object({
   improvements: z.string().min(1).max(5000),
   remainingIssues: z.string().min(1).max(5000),
 });
+
+const gameAttemptMetricsSchema = z.object({
+  totalTrials: z.number().int().min(1).max(500),
+  correct: z.number().int().min(0).max(500),
+  mistakes: z.number().int().min(0).max(500),
+  accuracy: z.number().finite().min(0).max(1),
+  averageResponseMs: z.number().int().min(0).max(3_600_000),
+}).strict().refine(
+  value => value.correct + value.mistakes === value.totalTrials,
+  "정답 수와 오류 수의 합이 전체 문항 수와 일치해야 합니다.",
+);
 
 const storedHttpsUrlSchema = z.string().trim().max(2048).url().refine(
   value => new URL(value).protocol === "https:",
@@ -1358,8 +1374,8 @@ JSON 형식으로 다음을 제공해주세요:
     // 답변 수정 평가
     reviseAnswer: protectedProcedure
       .input(z.object({
-        qaId: z.number(),
-        revisedAnswer: z.string(),
+        qaId: z.number().int().positive(),
+        revisedAnswer: z.string().trim().min(1).max(12_000),
       }))
       .mutation(async ({ ctx, input }) => {
         // 기존 QA 조회
@@ -1408,18 +1424,24 @@ JSON 형식으로 다음을 제공해주세요:
         }
 
         const content = response.choices[0].message.content;
-        let feedbackData;
+        let feedbackData: z.infer<typeof revisionFeedbackSchema>;
         try {
-          feedbackData = JSON.parse(typeof content === 'string' ? content : "{}");
-        } catch (parseError) {
-          console.error('[reviseAnswer] JSON 파싱 실패:', content);
-          feedbackData = {
-            score: 70,
-            feedback: "수정된 답변을 확인했습니다.",
-            improvements: "답변이 개선되었습니다.",
-            remainingIssues: "추가 개선이 필요합니다."
-          };
+          feedbackData = revisionFeedbackSchema.parse(
+            JSON.parse(typeof content === "string" ? content : "{}"),
+          );
+        } catch (validationError) {
+          console.error('[reviseAnswer] JSON 검증 실패:', validationError);
+          throw new TRPCError({
+            code: "INTERNAL_SERVER_ERROR",
+            message: "재평가 결과 형식이 올바르지 않습니다. 잠시 후 다시 시도해주세요.",
+          });
         }
+
+        await db.updateInterviewQA(input.qaId, {
+          revisedAnswer: input.revisedAnswer,
+          revisedFeedback: feedbackData.feedback,
+          revisedScore: feedbackData.score,
+        });
         
         return {
           score: feedbackData.score,
@@ -4340,17 +4362,32 @@ JSON 형식으로 다음을 제공해주세요:
     // 게임 결과 저장
     saveResult: protectedProcedure
       .input(z.object({
-        gameType: z.enum(['rps', 'rotation', 'numberClick', 'pathMaking']),
-        score: z.number().min(0).max(100),
-        timeSpent: z.number().optional(),
-        level: z.number().default(1),
-        mistakes: z.number().default(0),
-        metadata: z.string().optional(),
+        assessmentType: z.enum(GAME_ASSESSMENT_IDS),
+        score: z.number().int().min(0).max(100),
+        timeSpent: z.number().int().min(0).max(3_600_000).optional(),
+        level: z.number().int().min(1).max(20).default(1),
+        mistakes: z.number().int().min(0).max(500).default(0),
+        metrics: gameAttemptMetricsSchema.optional(),
       }))
       .mutation(async ({ ctx, input }) => {
+        const definition = GAME_ASSESSMENT_BY_ID[input.assessmentType];
+        const verifiedScore = input.metrics
+          ? calculatePracticeScore(input.metrics.correct, input.metrics.totalTrials)
+          : input.score;
+        const verifiedMistakes = input.metrics?.mistakes ?? input.mistakes;
+        const metadata = JSON.stringify({
+          schemaVersion: 1,
+          assessmentType: input.assessmentType,
+          metrics: input.metrics,
+        });
         await db.saveGameResult({
           userId: ctx.user.id,
-          ...input,
+          gameType: definition.storageType,
+          score: verifiedScore,
+          timeSpent: input.timeSpent,
+          level: input.level,
+          mistakes: verifiedMistakes,
+          metadata,
         });
         return { success: true };
       }),
@@ -4358,10 +4395,10 @@ JSON 형식으로 다음을 제공해주세요:
     // 사용자 게임 결과 조회
     getResults: protectedProcedure
       .input(z.object({
-        gameType: z.enum(['rps', 'rotation', 'numberClick', 'pathMaking']).optional(),
+        assessmentType: z.enum(GAME_ASSESSMENT_IDS).optional(),
       }))
       .query(async ({ ctx, input }) => {
-        return db.getUserGameResults(ctx.user.id, input.gameType);
+        return db.getUserGameResults(ctx.user.id, input.assessmentType);
       }),
     
     // 게임 통계

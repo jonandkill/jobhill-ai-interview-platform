@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -27,6 +27,7 @@ export default function PathMakingGame({ onComplete, onRestart }: PathMakingGame
   const [level, setLevel] = useState(1);
   const [startPos, setStartPos] = useState<{ row: number; col: number }>({ row: 0, col: 0 });
   const [endPos, setEndPos] = useState<{ row: number; col: number }>({ row: 0, col: 0 });
+  const hasCompleted = useRef(false);
 
   const gridSize = 8 + level * 2; // 레벨별 그리드 크기
   const obstacleCount = level * 5; // 레벨별 장애물 개수
@@ -66,7 +67,8 @@ export default function PathMakingGame({ onComplete, onRestart }: PathMakingGame
       const row = Math.floor(Math.random() * gridSize);
       const col = Math.floor(Math.random() * gridSize);
       
-      if (newGrid[row][col].type === 'empty') {
+      // 위쪽 행과 오른쪽 열을 항상 열어 두어 최소 한 개의 경로를 보장합니다.
+      if (newGrid[row][col].type === 'empty' && row !== 0 && col !== gridSize - 1) {
         newGrid[row][col].type = 'obstacle';
         placedObstacles++;
       }
@@ -77,6 +79,7 @@ export default function PathMakingGame({ onComplete, onRestart }: PathMakingGame
   }, [gridSize, obstacleCount]);
 
   const startGame = () => {
+    hasCompleted.current = false;
     initializeGrid();
     setGameState('playing');
     setStartTime(Date.now());
@@ -90,8 +93,9 @@ export default function PathMakingGame({ onComplete, onRestart }: PathMakingGame
     }
   };
 
-  const handleCellMouseEnter = (row: number, col: number) => {
-    if (!isDrawing) return;
+  const handleCellMouseEnter = (row: number, col: number, allowTap = false) => {
+    if (hasCompleted.current) return;
+    if (!isDrawing && !allowTap) return;
     
     const cell = grid[row][col];
     if (cell.type === 'obstacle') return;
@@ -113,6 +117,7 @@ export default function PathMakingGame({ onComplete, onRestart }: PathMakingGame
     
     // 끝점에 도달했는지 확인
     if (row === endPos.row && col === endPos.col) {
+      hasCompleted.current = true;
       setIsDrawing(false);
       const finalTime = Date.now() - (startTime || 0);
       const score = calculateScore(finalTime, path.length + 1);
@@ -126,11 +131,10 @@ export default function PathMakingGame({ onComplete, onRestart }: PathMakingGame
   };
 
   const calculateScore = (time: number, pathLength: number) => {
-    const timeInSeconds = time / 1000;
     const optimalPath = gridSize * 2 - 2; // 최단 경로 길이
     const efficiency = Math.max(0, 100 - ((pathLength - optimalPath) / optimalPath) * 50);
-    const speedBonus = Math.max(0, 50 - timeInSeconds);
-    return Math.round(efficiency + speedBonus);
+    // 기기·입력 방식에 따른 속도 차이는 점수에 반영하지 않습니다.
+    return Math.max(0, Math.min(100, Math.round(efficiency)));
   };
 
   const formatTime = (ms: number) => {
@@ -165,11 +169,11 @@ export default function PathMakingGame({ onComplete, onRestart }: PathMakingGame
           <div className="p-4 bg-purple-500/10 border border-purple-500/30 rounded-lg">
             <h3 className="font-semibold text-purple-500 mb-2">게임 규칙</h3>
             <ul className="text-sm space-y-1 text-muted-foreground">
-              <li>• 녹색 시작점에서 마우스를 누른 채로 드래그하세요</li>
+              <li>• 녹색 시작점부터 드래그하거나 인접 칸을 차례로 탭하세요</li>
               <li>• 빨간색 끝점까지 경로를 그리세요</li>
               <li>• 회색 장애물은 피해야 합니다</li>
               <li>• 대각선 이동은 불가능합니다</li>
-              <li>• 최단 경로로 빠르게 완료할수록 높은 점수를 받습니다</li>
+              <li>• 점수는 경로 길이만 반영하며 입력 속도는 반영하지 않습니다</li>
             </ul>
           </div>
 
@@ -250,9 +254,9 @@ export default function PathMakingGame({ onComplete, onRestart }: PathMakingGame
           <div className="p-4 bg-purple-500/10 border border-purple-500/30 rounded-lg">
             <p className="text-sm font-medium text-purple-500 mb-2">평가 결과</p>
             <p className="text-sm text-muted-foreground">
-              {finalScore >= 80 ? "🎉 우수한 공간 지각력과 문제 해결 능력을 보여주셨습니다!" :
-               finalScore >= 60 ? "👍 양호한 수준입니다. 최단 경로를 찾는 연습을 더 해보세요." :
-               "💪 다양한 경로 탐색 전략을 시도해보세요!"}
+              {finalScore >= 80 ? "이번 시도에서는 목표에 가까운 경로를 만들었습니다." :
+               finalScore >= 60 ? "이번 시도에는 일부 우회가 있었습니다. 시작 전에 큰 방향을 먼저 정해보세요." :
+               "이번 시도에는 우회가 많았습니다. 구간별로 경로를 나눠 계획해보세요."}
             </p>
           </div>
 
@@ -284,7 +288,7 @@ export default function PathMakingGame({ onComplete, onRestart }: PathMakingGame
           </Badge>
         </div>
         <CardDescription>
-          녹색 시작점에서 빨간색 끝점까지 드래그하세요
+          녹색 시작점에서 빨간색 끝점까지 드래그하거나 인접 칸을 차례로 탭하세요
         </CardDescription>
       </CardHeader>
       <CardContent>
@@ -298,11 +302,22 @@ export default function PathMakingGame({ onComplete, onRestart }: PathMakingGame
         >
           {grid.map((row, rowIndex) =>
             row.map((cell, colIndex) => (
-              <div
+              <button
+                type="button"
                 key={`${rowIndex}-${colIndex}`}
                 className={`aspect-square rounded ${getCellColor(cell)} transition-colors cursor-pointer`}
                 onMouseDown={() => handleCellMouseDown(rowIndex, colIndex)}
                 onMouseEnter={() => handleCellMouseEnter(rowIndex, colIndex)}
+                onClick={() => {
+                  if (cell.type === "start") handleCellMouseDown(rowIndex, colIndex);
+                  else handleCellMouseEnter(rowIndex, colIndex, true);
+                }}
+                aria-label={
+                  cell.type === "start" ? "시작점" :
+                  cell.type === "end" ? "도착점" :
+                  cell.type === "obstacle" ? "장애물" :
+                  `${rowIndex + 1}행 ${colIndex + 1}열`
+                }
               />
             ))
           )}

@@ -1,4 +1,9 @@
 import { eq, and, desc, or, lte, gte, inArray, sql, like, count } from "drizzle-orm";
+import {
+  GAME_ASSESSMENT_BY_ID,
+  getStoredAssessmentId,
+  type GameAssessmentId,
+} from "@shared/gameAssessments";
 import { drizzle } from "drizzle-orm/mysql2";
 import { 
   InsertUser, users, 
@@ -2927,15 +2932,18 @@ export async function saveGameResult(data: InsertGameResult) {
   return result;
 }
 
-export async function getUserGameResults(userId: number, gameType?: string) {
+export async function getUserGameResults(userId: number, assessmentType?: GameAssessmentId) {
   const db = await getDb();
   if (!db) return [];
   
-  if (gameType) {
+  if (assessmentType) {
+    const storageType = GAME_ASSESSMENT_BY_ID[assessmentType].storageType;
     const results = await db.select().from(gameResults)
-      .where(and(eq(gameResults.userId, userId), eq(gameResults.gameType, gameType as any)))
+      .where(and(eq(gameResults.userId, userId), eq(gameResults.gameType, storageType)))
       .orderBy(desc(gameResults.createdAt));
-    return results;
+    return results.filter(
+      result => getStoredAssessmentId(result.gameType, result.metadata) === assessmentType,
+    );
   }
   
   const results = await db.select().from(gameResults)
@@ -2948,32 +2956,61 @@ export async function getGameStats(userId: number) {
   const db = await getDb();
   if (!db) return null;
   
-  const results = await db.select().from(gameResults).where(eq(gameResults.userId, userId));
+  const results = await db.select().from(gameResults)
+    .where(eq(gameResults.userId, userId))
+    .orderBy(desc(gameResults.createdAt));
   
   if (results.length === 0) return null;
   
-  // 게임 유형별 통계
-  const statsByType: Record<string, { count: number; avgScore: number; bestScore: number }> = {};
-  
+  const grouped = new Map<GameAssessmentId, typeof results>();
   for (const result of results) {
-    if (!statsByType[result.gameType]) {
-      statsByType[result.gameType] = { count: 0, avgScore: 0, bestScore: 0 };
-    }
-    
-    statsByType[result.gameType].count++;
-    statsByType[result.gameType].avgScore += result.score;
-    statsByType[result.gameType].bestScore = Math.max(statsByType[result.gameType].bestScore, result.score);
+    const assessmentType = getStoredAssessmentId(result.gameType, result.metadata);
+    if (!assessmentType) continue;
+    const attempts = grouped.get(assessmentType) ?? [];
+    attempts.push(result);
+    grouped.set(assessmentType, attempts);
   }
-  
-  // 평균 점수 계산
-  for (const type in statsByType) {
-    statsByType[type].avgScore = Math.round(statsByType[type].avgScore / statsByType[type].count);
+
+  const median = (values: number[]) => {
+    const sorted = [...values].sort((a, b) => a - b);
+    const middle = Math.floor(sorted.length / 2);
+    return sorted.length % 2
+      ? sorted[middle]
+      : Math.round((sorted[middle - 1] + sorted[middle]) / 2);
+  };
+  const statsByAssessment: Partial<Record<GameAssessmentId, {
+    count: number;
+    latestScore: number;
+    recentMedian: number;
+    changeFromPrevious: number | null;
+  }>> = {};
+
+  for (const [assessmentType, attempts] of grouped) {
+    const recentMedian = median(attempts.slice(0, 5).map(attempt => attempt.score));
+    const previous = attempts.slice(5, 10);
+    const previousMedian = previous.length > 0 ? median(previous.map(attempt => attempt.score)) : null;
+    statsByAssessment[assessmentType] = {
+      count: attempts.length,
+      latestScore: attempts[0].score,
+      recentMedian,
+      changeFromPrevious: previousMedian === null ? null : recentMedian - previousMedian,
+    };
   }
   
   return {
-    totalGames: results.length,
-    statsByType,
-    recentResults: results.slice(0, 10),
+    totalAttempts: results.length,
+    statsByAssessment,
+    recentResults: results.slice(0, 10).flatMap(result => {
+      const assessmentType = getStoredAssessmentId(result.gameType, result.metadata);
+      return assessmentType ? [{
+        id: result.id,
+        assessmentType,
+        score: result.score,
+        timeSpent: result.timeSpent,
+        mistakes: result.mistakes,
+        createdAt: result.createdAt,
+      }] : [];
+    }),
   };
 }
 

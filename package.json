@@ -14,7 +14,7 @@
     "check": "tsc --noEmit",
     "format": "prettier --write .",
     "test": "vitest run",
-    "test:ci": "vitest run client/src/lib/mediaDeviceLifecycle.test.ts client/src/lib/interviewWizard.test.ts client/src/lib/interviewWizardFlow.test.ts client/src/lib/safeHtml.test.ts client/src/lib/transcriptAnalysis.test.ts shared/products.test.ts server/auth.logout.test.ts server/realInterview.test.ts server/receipt.test.ts server/tossPayment.test.ts server/ttsHttp.test.ts server/qwenTTS.test.ts server/supertonicTTS.test.ts",
+    "test:ci": "vitest run client/src/lib/mediaDeviceLifecycle.test.ts client/src/lib/interviewWizard.test.ts client/src/lib/interviewWizardFlow.test.ts client/src/lib/safeHtml.test.ts client/src/lib/transcriptAnalysis.test.ts shared/gameAssessments.test.ts shared/products.test.ts server/auth.logout.test.ts server/realInterview.test.ts server/receipt.test.ts server/tossPayment.test.ts server/ttsHttp.test.ts server/qwenTTS.test.ts server/supertonicTTS.test.ts",
     "db:push": "drizzle-kit generate && drizzle-kit migrate"
   },
   "dependencies": {

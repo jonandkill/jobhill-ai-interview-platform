@@ -52,7 +52,7 @@ export default function RockPaperScissorsGame({ onComplete, duration = 30 }: Roc
       setTimeLeft(prev => {
         if (prev <= 1) {
           setIsPlaying(false);
-          onComplete(score);
+          onComplete(Math.max(0, Math.min(100, score)));
           return 0;
         }
         return prev - 1;
@@ -64,7 +64,11 @@ export default function RockPaperScissorsGame({ onComplete, duration = 30 }: Roc
 
   // 모드 변경 카운트다운
   useEffect(() => {
-    if (modeChangeCountdown === null || modeChangeCountdown <= 0) return;
+    if (modeChangeCountdown === null) return;
+    if (modeChangeCountdown <= 0) {
+      setModeChangeCountdown(null);
+      return;
+    }
     
     const timer = setTimeout(() => {
       setModeChangeCountdown(prev => prev! - 1);
@@ -103,7 +107,7 @@ export default function RockPaperScissorsGame({ onComplete, duration = 30 }: Roc
     setResult(gameResult);
     
     if (gameResult === 'win') {
-      setScore(prev => prev + 10);
+      setScore(prev => Math.min(100, prev + 10));
     } else if (gameResult === 'lose') {
       setScore(prev => Math.max(0, prev - 5));
     }
