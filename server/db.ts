@@ -2962,7 +2962,8 @@ export async function getGameStats(userId: number) {
   
   if (results.length === 0) return null;
   
-  const grouped = new Map<GameAssessmentId, typeof results>();
+  type GameResultRow = (typeof results)[number];
+  const grouped = new Map<GameAssessmentId, GameResultRow[]>();
   for (const result of results) {
     const assessmentType = getStoredAssessmentId(result.gameType, result.metadata);
     if (!assessmentType) continue;
@@ -2985,7 +2986,7 @@ export async function getGameStats(userId: number) {
     changeFromPrevious: number | null;
   }>> = {};
 
-  for (const [assessmentType, attempts] of grouped) {
+  grouped.forEach((attempts, assessmentType) => {
     const recentMedian = median(attempts.slice(0, 5).map(attempt => attempt.score));
     const previous = attempts.slice(5, 10);
     const previousMedian = previous.length > 0 ? median(previous.map(attempt => attempt.score)) : null;
@@ -2995,7 +2996,7 @@ export async function getGameStats(userId: number) {
       recentMedian,
       changeFromPrevious: previousMedian === null ? null : recentMedian - previousMedian,
     };
-  }
+  });
   
   return {
     totalAttempts: results.length,

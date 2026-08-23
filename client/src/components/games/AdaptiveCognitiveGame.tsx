@@ -227,7 +227,7 @@ export default function AdaptiveCognitiveGame({
       setFinalStats({ correct: nextCorrect, mistakes: nextMistakes, score, averageResponseMs });
       setFinished(true);
       onComplete(score, timeMs, nextMistakes, {
-        totalTrials,
+        totalTrials: totalRounds,
         correct: nextCorrect,
         mistakes: nextMistakes,
         accuracy: nextCorrect / totalRounds,
