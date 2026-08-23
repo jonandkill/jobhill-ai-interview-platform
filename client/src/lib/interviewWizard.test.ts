@@ -15,10 +15,12 @@ describe("interview setup wizard", () => {
     expect(INTERVIEW_SETUP_LABELS).toHaveLength(7);
   });
 
-  it("requires company, position, and at least one profile document", () => {
-    expect(canContinueInterviewWizard({ company: "삼성전자", position: "개발", hasProfileMaterial: true })).toBe(true);
-    expect(canContinueInterviewWizard({ company: "", position: "개발", hasProfileMaterial: true })).toBe(false);
-    expect(canContinueInterviewWizard({ company: "삼성전자", position: "개발", hasProfileMaterial: false })).toBe(false);
+  it("accepts either applicant documents or a complete company and position pair", () => {
+    expect(canContinueInterviewWizard({ company: "", position: "", hasProfileMaterial: true })).toBe(true);
+    expect(canContinueInterviewWizard({ company: "삼성전자", position: "개발", hasProfileMaterial: false })).toBe(true);
+    expect(canContinueInterviewWizard({ company: "", position: "개발", hasProfileMaterial: false })).toBe(false);
+    expect(canContinueInterviewWizard({ company: "삼성전자", position: "", hasProfileMaterial: false })).toBe(false);
+    expect(canContinueInterviewWizard({ company: "", position: "", hasProfileMaterial: false })).toBe(false);
   });
 
   it("provides different recovery instructions for timeout and error", () => {

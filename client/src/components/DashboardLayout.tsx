@@ -49,7 +49,7 @@ const menuGroups = [
     icon: Brain,
     items: [
       { icon: Brain, label: "모의 면접 시작", path: "/interview" },
-      { icon: Zap, label: "리얼 면접", path: "/real-interview" },
+      { icon: Zap, label: "화상 모의면접", path: "/interview" },
       { icon: Sparkles, label: "AI 실시간 평가", path: "/ai-evaluation" },
       { icon: Gamepad2, label: "게임형 평가", path: "/game-assessment" },
     ]

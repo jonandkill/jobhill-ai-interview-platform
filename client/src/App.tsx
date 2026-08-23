@@ -56,7 +56,6 @@ const VerifyEmail = lazy(() => import("./pages/VerifyEmail"));
 const GameAssessment = lazy(() => import("./pages/GameAssessment"));
 const AIEvaluation = lazy(() => import("./pages/AIEvaluation"));
 const ComprehensiveResults = lazy(() => import("./pages/ComprehensiveResults"));
-const RealInterview = lazy(() => import("./pages/RealInterview"));
 
 function RouteLoadingFallback() {
   return (
@@ -87,7 +86,7 @@ function Router() {
       <Route path="/profile" component={Profile} />
       <Route path="/interview" component={Interview} />
       <Route path="/interview/:id" component={Interview} />
-      <Route path="/real-interview" component={RealInterview} />
+      <Route path="/real-interview" component={Interview} />
       <Route path="/result/:id" component={InterviewResult} />
       <Route path="/pricing" component={Pricing} />
       {/* Legacy payment routes - hidden */}

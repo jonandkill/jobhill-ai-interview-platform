@@ -52,6 +52,7 @@ import { QuestionShareModal } from "@/components/QuestionShareModal";
 import CouponInputModal from "@/components/CouponInputModal";
 import { ReviewIncentiveDialog } from "@/components/ReviewIncentiveDialog";
 import InterviewMediaCheck from "@/components/InterviewMediaCheck";
+import InstantAnswerCorrection from "@/components/InstantAnswerCorrection";
 import InterviewCheckpoint from "@/components/InterviewCheckpoint";
 
 import AnalyzingLoader from "@/components/AnalyzingLoader";
@@ -87,6 +88,7 @@ import { toast } from "sonner";
 import { Link, useLocation } from "wouter";
 import { Streamdown } from "streamdown";
 import { correctSpeechText, generateSpeechHintMessage } from "@/lib/speechDictionary";
+import { normalizeTranscriptionAudioMimeType, selectInterviewAudioMimeType } from "@/lib/interviewAudioCapture";
 import { escapeHtml, escapeHtmlWithBreaks } from "@/lib/safeHtml";
 import {
   INTERVIEW_PHASES,
@@ -257,7 +259,12 @@ export default function Interview() {
   });
   
   const [status, setStatus] = useState<SessionStatus>("idle");
+  const statusRef = useRef<SessionStatus>("idle");
   const [sessionId, setSessionId] = useState<number | null>(null);
+
+  useEffect(() => {
+    statusRef.current = status;
+  }, [status]);
 
   // 모의면접 시작 전에는 한 화면에 모든 설정을 노출하지 않고 단계별로 진행합니다.
   const [setupStep, setSetupStep] = useState<InterviewSetupStep>(0);
@@ -265,6 +272,8 @@ export default function Interview() {
   const [questionGenerationError, setQuestionGenerationError] = useState<string | null>(null);
   const [wizardCompany, setWizardCompany] = useState("");
   const [wizardPosition, setWizardPosition] = useState("");
+  const [wizardResume, setWizardResume] = useState("");
+  const [wizardCoverLetter, setWizardCoverLetter] = useState("");
   const [planMode, setPlanMode] = useState<"structured" | "selected_only">("structured");
   const [recordingMode, setRecordingMode] = useState<"manual" | "automatic">("manual");
   const [silenceThreshold, setSilenceThreshold] = useState(3);
@@ -274,7 +283,7 @@ export default function Interview() {
   const [qas, setQas] = useState<QAItem[]>([]);
   const [answer, setAnswer] = useState("");
   const [questionIndex, setQuestionIndex] = useState(0);
-  const [totalQuestions, setTotalQuestions] = useState(5);
+  const [totalQuestions, setTotalQuestions] = useState(3);
   const [voiceMode, setVoiceMode] = useState(() => {
     if (typeof window !== 'undefined') {
       const saved = localStorage.getItem('interviewVoiceMode');
@@ -297,7 +306,6 @@ export default function Interview() {
   const [ttsTone, setTtsTone] = useState<'calm' | 'energetic' | 'professional'>('professional');
   const [ttsVoiceType, setTtsVoiceType] = useState<string>('natural'); // 음성 유형 선택
   const [customPitch, setCustomPitch] = useState(1.0); // 사용자 맞춤 음높이 (0.5 ~ 1.5, 기본값 1.0)
-  const [answerVersionPreference, setAnswerVersionPreference] = useState<'short' | 'long'>('long');
   
   // 음성 면접 흐름 개선을 위한 상태
   const [showVoiceConfirmDialog, setShowVoiceConfirmDialog] = useState(false);
@@ -406,7 +414,9 @@ export default function Interview() {
     if (!profile) return;
     setWizardCompany(profile.targetCompany || "");
     setWizardPosition(profile.targetPosition || "");
-  }, [profile?.targetCompany, profile?.targetPosition]);
+    setWizardResume(profile.resume || "");
+    setWizardCoverLetter(profile.coverLetter || "");
+  }, [profile?.targetCompany, profile?.targetPosition, profile?.resume, profile?.coverLetter]);
   const [timerOvertime, setTimerOvertime] = useState(false); // 시간 초과 여부
   const [overtimeSeconds, setOvertimeSeconds] = useState(0); // 초과 시간
   
@@ -436,6 +446,12 @@ export default function Interview() {
   const [recordedAudioUrl, setRecordedAudioUrl] = useState<string | null>(null);
   const [isPlayingRecording, setIsPlayingRecording] = useState(false);
   const [mediaRecorder, setMediaRecorder] = useState<MediaRecorder | null>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const recordingStreamRef = useRef<MediaStream | null>(null);
+  const recordingAudioContextRef = useRef<AudioContext | null>(null);
+  const recordingSilenceIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const recordingStartPendingRef = useRef(false);
+  const autoRecordTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [audioChunks, setAudioChunks] = useState<Blob[]>([]);
   const [isRecording, setIsRecording] = useState(false);
   const audioPlayerRef = useState<HTMLAudioElement | null>(null);
@@ -451,7 +467,6 @@ export default function Interview() {
   // Whisper API 음성 인식 mutation
   const whisperTranscribeMutation = trpc.voice.transcribe.useMutation({
     onSuccess: (data) => {
-      console.log('[Whisper API] 음성 인식 성공:', data.text);
       if (data.text) {
         setAnswer(prev => {
           const newAnswer = prev + (prev ? ' ' : '') + data.text.trim();
@@ -481,112 +496,180 @@ export default function Interview() {
     },
   });
 
-  // 음성 녹음 시작 (Whisper API 연동)
-  const startRecording = async () => {
+  const releaseRecordingResources = useCallback((cancelRecorder = false) => {
+    if (recordingSilenceIntervalRef.current) {
+      clearInterval(recordingSilenceIntervalRef.current);
+      recordingSilenceIntervalRef.current = null;
+    }
+    const recorder = mediaRecorderRef.current;
+    if (cancelRecorder && recorder && recorder.state !== "inactive") {
+      recorder.ondataavailable = null;
+      recorder.onstop = null;
+      recorder.onerror = null;
+      recorder.stop();
+    }
+    recordingStreamRef.current?.getTracks().forEach(track => track.stop());
+    recordingStreamRef.current = null;
+    void recordingAudioContextRef.current?.close().catch(() => undefined);
+    recordingAudioContextRef.current = null;
+    mediaRecorderRef.current = null;
+    recordingStartPendingRef.current = false;
+  }, []);
+
+  const submitRecordedAudioForTranscription = async (blob: Blob, mimeType: string) => {
+    if (!sessionId) {
+      toast.error("음성 면접 세션을 확인할 수 없습니다. 질문을 다시 불러와주세요.");
+      return;
+    }
+    if (blob.size === 0) {
+      toast.error("녹음된 오디오가 없습니다.");
+      return;
+    }
+    if (blob.size > 12 * 1024 * 1024) {
+      toast.error("오디오 파일이 너무 큽니다. 12MB보다 짧게 녹음해주세요.");
+      return;
+    }
+
+    setIsTranscribing(true);
+    setInterimTranscript("음성을 텍스트로 변환 중...");
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const recorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
+      const arrayBuffer = await blob.arrayBuffer();
+      const bytes = new Uint8Array(arrayBuffer);
+      let binary = "";
+      for (const byte of bytes) binary += String.fromCharCode(byte);
+      whisperTranscribeMutation.mutate({
+        sessionId,
+        audioBase64: btoa(binary),
+        mimeType: normalizeTranscriptionAudioMimeType(mimeType),
+        language: "ko",
+      });
+    } catch (error) {
+      console.error("[Whisper API] 오디오 인코딩 실패:", error);
+      setIsTranscribing(false);
+      setInterimTranscript("");
+      toast.error("음성 변환을 준비하지 못했습니다.");
+    }
+  };
+
+  // TTS 종료 뒤 자동으로 시작하는 녹음과 수동 녹음이 같은 생애주기를 사용합니다.
+  const startRecording = async () => {
+    if (recordingStartPendingRef.current || mediaRecorderRef.current?.state === "recording" || isTranscribing) return;
+    recordingStartPendingRef.current = true;
+    let stream: MediaStream | null = null;
+    let audioContext: AudioContext | null = null;
+
+    try {
+      if (!navigator.mediaDevices?.getUserMedia) {
+        throw new Error("이 브라우저는 마이크를 지원하지 않습니다.");
+      }
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      if (statusRef.current !== "answering") {
+        stream.getTracks().forEach(track => track.stop());
+        return;
+      }
+
+      const selectedMimeType = selectInterviewAudioMimeType(type => MediaRecorder.isTypeSupported(type));
+      const recorder = selectedMimeType
+        ? new MediaRecorder(stream, { mimeType: selectedMimeType })
+        : new MediaRecorder(stream);
+      const actualMimeType = recorder.mimeType || selectedMimeType || "audio/webm";
       const chunks: Blob[] = [];
-      
-      // 무음 감지를 위한 AudioContext 설정
-      const audioContext = new AudioContext();
+
+      recordingStreamRef.current = stream;
+      mediaRecorderRef.current = recorder;
+      setMediaRecorder(recorder);
+
+      audioContext = new AudioContext();
+      recordingAudioContextRef.current = audioContext;
       const audioSource = audioContext.createMediaStreamSource(stream);
       const analyser = audioContext.createAnalyser();
       analyser.fftSize = 2048;
       audioSource.connect(analyser);
-      
-      const bufferLength = analyser.frequencyBinCount;
-      const dataArray = new Uint8Array(bufferLength);
-      
+      const dataArray = new Uint8Array(analyser.frequencyBinCount);
       let hasSpeech = false;
       let lastSoundAt = Date.now();
-      let silenceInterval: ReturnType<typeof setInterval> | null = null;
-      const detectSilence = () => {
-        analyser.getByteTimeDomainData(dataArray);
-        let sum = 0;
-        for (let index = 0; index < dataArray.length; index += 1) {
-          const normalized = (dataArray[index] - 128) / 128;
-          sum += normalized * normalized;
+
+      const finishResources = () => {
+        if (recordingSilenceIntervalRef.current) {
+          clearInterval(recordingSilenceIntervalRef.current);
+          recordingSilenceIntervalRef.current = null;
         }
-        const rms = Math.sqrt(sum / dataArray.length);
-        if (rms > 0.035) {
-          hasSpeech = true;
-          lastSoundAt = Date.now();
-          return;
-        }
-        if (recordingMode === "automatic" && hasSpeech && (Date.now() - lastSoundAt) / 1000 >= silenceThreshold && recorder.state !== "inactive") {
-          toast.info(`${silenceThreshold}초 동안 음성이 없어 답변을 마칩니다.`);
-          recorder.stop();
-          setIsRecording(false);
-        }
+        stream?.getTracks().forEach(track => track.stop());
+        if (recordingStreamRef.current === stream) recordingStreamRef.current = null;
+        void audioContext?.close().catch(() => undefined);
+        if (recordingAudioContextRef.current === audioContext) recordingAudioContextRef.current = null;
+        if (mediaRecorderRef.current === recorder) mediaRecorderRef.current = null;
+        setMediaRecorder(null);
+        setIsRecording(false);
+        setIsListening(false);
       };
-      
-      recorder.ondataavailable = (e) => {
-        if (e.data.size > 0) {
-          chunks.push(e.data);
-        }
+
+      recorder.ondataavailable = event => {
+        if (event.data.size > 0) chunks.push(event.data);
       };
-      
-      recorder.onstop = async () => {
-        if (silenceInterval) clearInterval(silenceInterval);
-        audioContext.close();
-        const blob = new Blob(chunks, { type: 'audio/webm' });
-        const url = URL.createObjectURL(blob);
-        setRecordedAudioUrl(url);
+      recorder.onstop = () => {
+        finishResources();
+        const blob = new Blob(chunks, { type: actualMimeType });
+        setRecordedAudioUrl(previous => {
+          if (previous) URL.revokeObjectURL(previous);
+          return URL.createObjectURL(blob);
+        });
         setAudioChunks([]);
-        stream.getTracks().forEach(track => track.stop());
-        
-        // Whisper API로 음성 인식 (로그인 사용자만)
-        if (useWhisperApi && subscription) {
-          setIsTranscribing(true);
-          setInterimTranscript('음성을 텍스트로 변환 중...');
-          
-          try {
-            // Blob을 Base64로 변환
-            const arrayBuffer = await blob.arrayBuffer();
-            const base64 = btoa(
-              new Uint8Array(arrayBuffer).reduce(
-                (data, byte) => data + String.fromCharCode(byte),
-                ''
-              )
-            );
-            
-            // Whisper API 호출
-            whisperTranscribeMutation.mutate({
-              audioBase64: base64,
-              mimeType: 'audio/webm',
-              language: 'ko',
-            });
-          } catch (error) {
-            console.error('[Whisper API] Base64 변환 실패:', error);
-            setIsTranscribing(false);
-            setInterimTranscript('');
-          }
-        }
+        if (useWhisperApi) void submitRecordedAudioForTranscription(blob, actualMimeType);
       };
-      
-      setMediaRecorder(recorder);
+      recorder.onerror = event => {
+        console.error("[Whisper API] 녹음 오류:", event);
+        finishResources();
+        toast.error("녹음 중 오류가 발생했습니다.");
+      };
+
+      recorder.start(1000);
       setAudioChunks(chunks);
-      recorder.start();
-      if (recordingMode === "automatic") {
-        silenceInterval = setInterval(detectSilence, 250);
-      }
       setIsRecording(true);
-      
-      // Whisper API 사용 시 실시간 안내
-      if (useWhisperApi && subscription) {
-        setInterimTranscript('녹음 중... (녹음 종료 후 자동 변환)');
+      setIsListening(true);
+      setLastSpeechTime(Date.now());
+      setInterimTranscript("녹음 중... 종료하면 답변을 바로 글로 바꿉니다.");
+
+      if (recordingMode === "automatic") {
+        recordingSilenceIntervalRef.current = setInterval(() => {
+          analyser.getByteTimeDomainData(dataArray);
+          let sum = 0;
+          for (const sample of dataArray) {
+            const normalized = (sample - 128) / 128;
+            sum += normalized * normalized;
+          }
+          const rms = Math.sqrt(sum / dataArray.length);
+          if (rms > 0.035) {
+            hasSpeech = true;
+            lastSoundAt = Date.now();
+          } else if (hasSpeech && (Date.now() - lastSoundAt) / 1000 >= silenceThreshold && recorder.state !== "inactive") {
+            toast.info(`${silenceThreshold}초 동안 음성이 없어 답변을 마칩니다.`);
+            recorder.stop();
+          }
+        }, 250);
       }
     } catch (error) {
-      toast.error("마이크 접근 권한이 필요합니다.");
+      stream?.getTracks().forEach(track => track.stop());
+      void audioContext?.close().catch(() => undefined);
+      if (recordingStreamRef.current === stream) recordingStreamRef.current = null;
+      if (recordingAudioContextRef.current === audioContext) recordingAudioContextRef.current = null;
+      mediaRecorderRef.current = null;
+      setMediaRecorder(null);
+      setIsRecording(false);
+      setIsListening(false);
+      toast.error(error instanceof Error ? error.message : "마이크 접근 권한이 필요합니다.");
+    } finally {
+      recordingStartPendingRef.current = false;
     }
   };
 
   // 음성 녹음 중지
   const stopRecording = () => {
-    if (mediaRecorder && mediaRecorder.state !== 'inactive') {
-      mediaRecorder.stop();
+    const recorder = mediaRecorderRef.current;
+    if (recorder && recorder.state !== "inactive") {
+      recorder.stop();
       setIsRecording(false);
+      setIsListening(false);
     }
   };
 
@@ -691,7 +774,6 @@ export default function Interview() {
             const transcript = result[0]?.transcript || '';
             const confidence = result[0]?.confidence || 0;
             const isFinal = result.isFinal;
-            console.log(`[SpeechRecognition] Result ${i}: "${transcript}" (isFinal: ${isFinal}, confidence: ${confidence})`);
             
             // iOS에서는 모든 결과를 final로 처리
             if (isFinal || isIOS) {
@@ -703,17 +785,14 @@ export default function Interview() {
           
           // 중간 결과 실시간 표시 - 즉시 업데이트
           if (interim) {
-            console.log('[SpeechRecognition] Setting interim transcript:', interim);
             setInterimTranscript(interim);
           }
           
           if (finalTranscript) {
-            console.log('[SpeechRecognition] Final transcript:', finalTranscript);
             // 전문 용어 사전으로 교정
             const correctedTranscript = correctSpeechText(finalTranscript);
             setAnswer(prev => {
               const newAnswer = prev + (prev ? ' ' : '') + correctedTranscript;
-              console.log('[SpeechRecognition] Updated answer:', newAnswer);
               // 모바일에서 텍스트 입력 필드에 반영되도록 강제 업데이트
               return newAnswer;
             });
@@ -788,149 +867,36 @@ export default function Interview() {
   // 음성 인식 시작/중지 핸들러
   // Whisper API 기반 음성 녹음 시작/중지
   const toggleListening = async () => {
-    // Whisper API 사용 시
     if (useWhisperApi) {
-      if (isRecording) {
-        // 녹음 중지 및 Whisper API로 변환
-        if (mediaRecorder && mediaRecorder.state !== 'inactive') {
-          mediaRecorder.stop();
-          console.log('[Whisper API] 녹음 중지');
+      if (mediaRecorderRef.current?.state === "recording" || isRecording) {
+        stopRecording();
+      } else {
+        await startRecording();
+        if (mediaRecorderRef.current?.state === "recording") {
+          toast.success("음성 녹음을 시작합니다. 말씀해주세요!");
         }
-        setIsRecording(false);
+      }
+      return;
+    }
+
+    if (!speechRecognition) {
+      toast.error("이 브라우저는 음성 인식을 지원하지 않습니다. 텍스트로 답변해주세요.");
+      return;
+    }
+    try {
+      if (isListening) {
+        speechRecognition.stop();
         setIsListening(false);
       } else {
-        // 녹음 시작
-        try {
-          if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-            toast.error('이 브라우저는 마이크를 지원하지 않습니다.');
-            return;
-          }
-          
-          const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-          
-          // 모바일 호환성을 위한 MIME 타입 선택
-          let mimeType: 'audio/webm' | 'audio/webm;codecs=opus' | 'audio/mp4' | 'audio/ogg' = 'audio/webm';
-          if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) {
-            mimeType = 'audio/webm;codecs=opus';
-          } else if (MediaRecorder.isTypeSupported('audio/mp4')) {
-            mimeType = 'audio/mp4';
-          } else if (MediaRecorder.isTypeSupported('audio/ogg')) {
-            mimeType = 'audio/ogg';
-          }
-          
-          const recorder = new MediaRecorder(stream, { mimeType });
-          const chunks: Blob[] = [];
-          
-          recorder.ondataavailable = (e) => {
-            if (e.data.size > 0) {
-              chunks.push(e.data);
-              console.log('[Whisper API] 오디오 청크 추가:', e.data.size, 'bytes');
-            }
-          };
-          
-          recorder.onstop = async () => {
-            console.log('[Whisper API] 녹음 완료, 총', chunks.length, '개 청크');
-            stream.getTracks().forEach(track => track.stop());
-            
-            if (chunks.length === 0) {
-              toast.error('녹음된 오디오가 없습니다.');
-              return;
-            }
-            
-            const audioBlob = new Blob(chunks, { type: mimeType });
-            console.log('[Whisper API] 오디오 Blob 생성:', audioBlob.size, 'bytes');
-            
-            // 16MB 제한 확인
-            if (audioBlob.size > 16 * 1024 * 1024) {
-              toast.error('오디오 파일이 너무 큽니다. (16MB 제한)');
-              return;
-            }
-            
-            // Base64로 변환
-            setIsTranscribing(true);
-            try {
-              const reader = new FileReader();
-              reader.onloadend = async () => {
-                const base64 = (reader.result as string).split(',')[1];
-                console.log('[Whisper API] Base64 변환 완료, 길이:', base64.length);
-                
-                // Whisper API 호출
-                const apiMimeType = mimeType === 'audio/webm;codecs=opus'
-                  ? 'audio/webm'
-                  : mimeType;
-                whisperTranscribeMutation.mutate({
-                  audioBase64: base64,
-                  mimeType: apiMimeType,
-                  language: 'ko',
-                });
-              };
-              reader.readAsDataURL(audioBlob);
-            } catch (err) {
-              console.error('[Whisper API] Base64 변환 오류:', err);
-              setIsTranscribing(false);
-              toast.error('음성 변환에 실패했습니다.');
-            }
-          };
-          
-          recorder.onerror = (e) => {
-            console.error('[Whisper API] 녹음 오류:', e);
-            toast.error('녹음 중 오류가 발생했습니다.');
-            setIsRecording(false);
-            setIsListening(false);
-          };
-          
-          setMediaRecorder(recorder);
-          setAudioChunks([]);
-          recorder.start(1000); // 1초마다 데이터 수집
-          setIsRecording(true);
-          setIsListening(true);
-          setLastSpeechTime(Date.now());
-          console.log('[Whisper API] 녹음 시작');
-          toast.success('음성 녹음을 시작합니다. 말씀해주세요!');
-        } catch (err: any) {
-          console.error('[Whisper API] 마이크 오류:', err);
-          if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
-            toast.error('마이크 권한이 거부되었습니다. 브라우저 설정에서 권한을 허용해주세요.');
-          } else if (err.name === 'NotFoundError') {
-            toast.error('마이크를 찾을 수 없습니다.');
-          } else {
-            toast.error('마이크 접근에 실패했습니다: ' + (err.message || '알 수 없는 오류'));
-          }
-        }
-      }
-      return;
-    }
-    
-    // Web Speech API 폴백 (기존 코드)
-    if (!speechRecognition) {
-      toast.error('이 브라우저는 음성 인식을 지원하지 않습니다. Chrome 브라우저를 사용해주세요.');
-      return;
-    }
-    
-    if (isListening) {
-      try {
-        speechRecognition.stop();
-      } catch (e) {
-        console.error('Speech recognition stop error:', e);
-      }
-      setIsListening(false);
-    } else {
-      try {
-        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-          toast.error('이 브라우저는 마이크를 지원하지 않습니다.');
-          return;
-        }
-        
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        stream.getTracks().forEach(track => track.stop());
-        
+        // 별도 getUserMedia 권한 점검은 장치 해제 경합을 만들 수 있어 SpeechRecognition 오류 처리에 맡깁니다.
         speechRecognition.start();
         setIsListening(true);
-        toast.success('음성 인식을 시작합니다.');
-      } catch (err: any) {
-        console.error('Microphone permission error:', err);
-        toast.error('마이크 접근에 실패했습니다.');
+        toast.success("음성 인식을 시작합니다.");
       }
+    } catch (error) {
+      console.error("Speech recognition lifecycle error:", error);
+      setIsListening(false);
+      toast.error("음성 인식을 시작하지 못했습니다.");
     }
   };
 
@@ -1265,7 +1231,11 @@ export default function Interview() {
         if (voiceMode) {
           if (recordingMode === "automatic") {
             toast.info('질문 읽기 완료! 자동으로 녹음을 시작합니다.', { duration: 2000 });
-            window.setTimeout(() => { void startRecording(); }, 500);
+            if (autoRecordTimeoutRef.current) clearTimeout(autoRecordTimeoutRef.current);
+            autoRecordTimeoutRef.current = window.setTimeout(() => {
+              autoRecordTimeoutRef.current = null;
+              if (statusRef.current === "answering") void startRecording();
+            }, 500);
           } else {
             toast.info('질문 읽기 완료! 마이크 버튼을 눌러 답변해주세요.', { duration: 3000 });
           }
@@ -1328,7 +1298,11 @@ export default function Interview() {
           if (voiceMode) {
             if (recordingMode === "automatic") {
               toast.info('질문 읽기 완료! 자동으로 녹음을 시작합니다.', { duration: 2000 });
-              window.setTimeout(() => { void startRecording(); }, 500);
+              if (autoRecordTimeoutRef.current) clearTimeout(autoRecordTimeoutRef.current);
+            autoRecordTimeoutRef.current = window.setTimeout(() => {
+              autoRecordTimeoutRef.current = null;
+              if (statusRef.current === "answering") void startRecording();
+            }, 500);
             } else {
               toast.info('질문 읽기 완료! 마이크 버튼을 눌러 답변해주세요.', { duration: 3000 });
             }
@@ -1357,9 +1331,18 @@ export default function Interview() {
 
   // TTS 중지 함수
   const stopSpeaking = () => {
+    if (autoRecordTimeoutRef.current) {
+      clearTimeout(autoRecordTimeoutRef.current);
+      autoRecordTimeoutRef.current = null;
+    }
     if (currentAudio) {
+      currentAudio.onended = null;
+      currentAudio.onerror = null;
       currentAudio.pause();
       currentAudio.currentTime = 0;
+    }
+    if (typeof window !== "undefined" && "speechSynthesis" in window) {
+      window.speechSynthesis.cancel();
     }
     setIsSpeaking(false);
   };
@@ -1423,8 +1406,13 @@ export default function Interview() {
       if (speechRecognition) {
         speechRecognition.stop();
       }
+      if (autoRecordTimeoutRef.current) {
+        clearTimeout(autoRecordTimeoutRef.current);
+        autoRecordTimeoutRef.current = null;
+      }
+      releaseRecordingResources(true);
     };
-  }, [status, speechRecognition]);  // 타이머 카운트다운
+  }, [status, speechRecognition, releaseRecordingResources]);  // 타이머 카운트다운
   useEffect(() => {
     let interval: NodeJS.Timeout | null = null;
     
@@ -1640,6 +1628,10 @@ export default function Interview() {
 
   const startMutation = trpc.interview.start.useMutation({
     onSuccess: (data) => {
+      incrementUsageMutation.mutate({
+        sessionId: sessionTrackingId,
+        featureType: voiceMode ? "voice_interview" : "text_interview",
+      });
       setSessionId(data.id);
       setTotalQuestions(data.totalQuestions || totalQuestions);
       setStatus("in_progress");
@@ -1688,7 +1680,7 @@ export default function Interview() {
       }
       console.error("[generateQuestion] 질문 생성 실패:", error);
       setQuestionGenerationError(getQuestionRecoveryMessage(false));
-      setStatus("in_progress");
+      setStatus(currentQA ? "feedback" : "in_progress");
     },
   });
 
@@ -1723,31 +1715,7 @@ export default function Interview() {
         setAvatarEmotion(getEmotionByScore(data.score));
       }
       
-      // 꼬리 질문 연속 모드일 때 자동으로 첫 번째 후속 질문으로 진행
-      if (continuousFollowUpMode && followUpCount < maxFollowUpCount && data.followUpQuestions && data.followUpQuestions.length > 0) {
-        setTimeout(() => {
-          const nextFollowUp = data.followUpQuestions[0];
-          setCurrentQA({
-            id: Date.now(),
-            question: nextFollowUp,
-            questionType: 'follow_up',
-          });
-          setAnswer('');
-          setStatus('answering');
-          setFollowUpCount(prev => prev + 1);
-          
-          toast.info(`꼬리 질문 연속 모드: ${followUpCount + 1}/${maxFollowUpCount}회`, {
-            description: "자동으로 후속 질문이 진행됩니다"
-          });
-          
-          // 음성 모드일 때 TTS로 질문 읽어주기
-          if (voiceMode && ttsEnabled) {
-            setTimeout(() => {
-              speakQuestion(nextFollowUp);
-            }, 500);
-          }
-        }, 2000); // 2초 후 자동 진행
-      }
+      // 교정 답변은 사용자가 읽고 직접 다음 질문 또는 후속 질문을 선택할 때까지 유지합니다.
     },
     onError: (error) => {
       console.error('[submitAnswer] 오류 발생:', error);
@@ -1853,12 +1821,12 @@ export default function Interview() {
     }
     const requestId = ++questionGenerationRequestRef.current;
     setQuestionGenerationError(null);
-    setStatus("in_progress");
+    if (!currentQA) setStatus("in_progress");
     questionGenerationTimeoutRef.current = setTimeout(() => {
       if (requestId !== questionGenerationRequestRef.current) return;
       generateMutation.reset();
       setQuestionGenerationError(getQuestionRecoveryMessage(true));
-      setStatus("in_progress");
+      setStatus(currentQA ? "feedback" : "in_progress");
     }, 15000);
 
     generateMutation.mutate({
@@ -1880,15 +1848,25 @@ export default function Interview() {
   const saveSupportInfoAndContinue = async () => {
     const company = wizardCompany.trim();
     const position = wizardPosition.trim();
-    if (!company || !position) {
-      toast.error("지원 회사와 직무를 입력해주세요.");
+    const resume = wizardResume.trim();
+    const coverLetter = wizardCoverLetter.trim();
+    const hasCompleteTarget = Boolean(company && position);
+    const hasDocuments = Boolean(resume || coverLetter);
+
+    if ((company || position) && !hasCompleteTarget) {
+      toast.error("회사와 직무는 둘 다 입력하거나 둘 다 비워주세요.");
       return;
     }
+    if (!hasDocuments && !hasCompleteTarget) {
+      toast.error("이력서·자기소개서를 붙여넣거나 회사와 직무를 입력해주세요.");
+      return;
+    }
+
     await profileUpsertMutation.mutateAsync({
-      targetCompany: company,
-      targetPosition: position,
-      resume: profile?.resume || undefined,
-      coverLetter: profile?.coverLetter || undefined,
+      targetCompany: company || undefined,
+      targetPosition: position || undefined,
+      resume: resume || undefined,
+      coverLetter: coverLetter || undefined,
       experience: profile?.experience || undefined,
       education: profile?.education || undefined,
       skills: profile?.skills || undefined,
@@ -1897,8 +1875,13 @@ export default function Interview() {
   };
 
   const handleStart = async () => {
-    if (!wizardCompany.trim() || !wizardPosition.trim()) {
-      toast.error("먼저 지원 회사와 직무를 입력해주세요.");
+    const canStart = canContinueInterviewWizard({
+      company: wizardCompany,
+      position: wizardPosition,
+      hasProfileMaterial: Boolean(wizardResume.trim() || wizardCoverLetter.trim()),
+    });
+    if (!canStart) {
+      toast.error("이력서·자기소개서를 붙여넣거나 회사와 직무를 모두 입력해주세요.");
       setSetupStep(1);
       return;
     }
@@ -1940,12 +1923,6 @@ export default function Interview() {
       }
     }
 
-    // 사용 횟수 증가
-    incrementUsageMutation.mutate({
-      sessionId: sessionTrackingId,
-      featureType: voiceMode ? "voice_interview" : "text_interview",
-    });
-
     setStatus("starting");
     startMutation.mutate({
       sessionType: "mock_interview",
@@ -1971,7 +1948,7 @@ export default function Interview() {
       setQaAnswerDurations(prev => ({ ...prev, [currentQA.id]: duration }));
     }
     
-    setStatus("in_progress");
+    // 피드백 생성 중에도 카메라 스트림을 유지해 모바일 장치 재획득 경합을 막습니다.
     
     // 후속 질문인지 확인
     const isFollowUp = currentQA.questionType === 'follow_up';
@@ -2001,10 +1978,8 @@ export default function Interview() {
       }
     } else {
       setQuestionIndex(nextIndex);
-      setCurrentQA(null);
       setAnswer("");
       setQuestionGenerationError(null);
-      setStatus("in_progress");
       if (sessionId) {
         generateQuestion(sessionId, nextIndex);
       }
@@ -2031,7 +2006,7 @@ export default function Interview() {
   // 시작 전 화면
   if (status === "idle") {
     const setupLabels = INTERVIEW_SETUP_LABELS;
-    const hasProfileMaterial = Boolean(profile?.resume?.trim() || profile?.coverLetter?.trim());
+    const hasProfileMaterial = Boolean(wizardResume.trim() || wizardCoverLetter.trim());
     const canMoveFromProfile = canContinueInterviewWizard({ company: wizardCompany, position: wizardPosition, hasProfileMaterial });
     const stepTitle = setupLabels[setupStep];
 
@@ -2091,25 +2066,45 @@ export default function Interview() {
                 {setupStep === 1 && (
                   <div className="space-y-5">
                     <div>
-                      <h2 className="text-xl font-semibold">어디에 지원하시나요?</h2>
-                      <p className="mt-2 text-sm leading-6 text-muted-foreground">회사와 직무를 먼저 저장하면 이력서·자기소개서와 함께 맞춤 질문을 만듭니다.</p>
+                      <h2 className="text-xl font-semibold">면접 질문의 기준을 입력해주세요</h2>
+                      <p className="mt-2 text-sm leading-6 text-muted-foreground">아래 두 방법 중 하나만 완료해도 시작할 수 있습니다: 이력서·자기소개서 붙여넣기 또는 회사+직무 입력.</p>
                     </div>
-                    <div className="grid gap-4 sm:grid-cols-2">
-                      <div className="space-y-2">
-                        <Label htmlFor="wizard-company">지원 회사</Label>
-                        <Input id="wizard-company" value={wizardCompany} onChange={(event: ChangeEvent<HTMLInputElement>) => setWizardCompany(event.target.value)} placeholder="예: 삼성전자" autoComplete="organization" />
+                    <div className="rounded-xl border p-4 space-y-4">
+                      <div>
+                        <p className="font-medium">방법 1. 지원 회사와 직무</p>
+                        <p className="mt-1 text-xs text-muted-foreground">문서가 없어도 직무 핵심역량 중심 질문을 만듭니다.</p>
+                      </div>
+                      <div className="grid gap-4 sm:grid-cols-2">
+                        <div className="space-y-2">
+                          <Label htmlFor="wizard-company">지원 회사</Label>
+                          <Input id="wizard-company" value={wizardCompany} onChange={(event: ChangeEvent<HTMLInputElement>) => setWizardCompany(event.target.value)} placeholder="예: 삼성전자" autoComplete="organization" />
+                        </div>
+                        <div className="space-y-2">
+                          <Label htmlFor="wizard-position">지원 직무</Label>
+                          <Input id="wizard-position" value={wizardPosition} onChange={(event: ChangeEvent<HTMLInputElement>) => setWizardPosition(event.target.value)} placeholder="예: 생산관리" autoComplete="organization-title" />
+                        </div>
+                      </div>
+                    </div>
+                    <div className="rounded-xl border p-4 space-y-4">
+                      <div>
+                        <p className="font-medium">방법 2. 이력서 또는 자기소개서</p>
+                        <p className="mt-1 text-xs text-muted-foreground">필요한 부분을 그대로 붙여넣으면 역할·성과·강조 꼭지를 바탕으로 질문합니다.</p>
                       </div>
                       <div className="space-y-2">
-                        <Label htmlFor="wizard-position">지원 직무</Label>
-                        <Input id="wizard-position" value={wizardPosition} onChange={(event: ChangeEvent<HTMLInputElement>) => setWizardPosition(event.target.value)} placeholder="예: 소프트웨어 개발" autoComplete="organization-title" />
+                        <Label htmlFor="wizard-resume">이력서 내용</Label>
+                        <Textarea id="wizard-resume" value={wizardResume} onChange={(event) => setWizardResume(event.target.value)} placeholder="경력, 프로젝트, 역할, 성과를 붙여넣어 주세요." className="min-h-28" maxLength={100000} />
                       </div>
+                      <div className="space-y-2">
+                        <Label htmlFor="wizard-cover-letter">자기소개서 내용</Label>
+                        <Textarea id="wizard-cover-letter" value={wizardCoverLetter} onChange={(event) => setWizardCoverLetter(event.target.value)} placeholder="지원 동기와 주요 경험을 붙여넣어 주세요." className="min-h-28" maxLength={100000} />
+                      </div>
+                      <p className="text-xs leading-5 text-muted-foreground">영상·음성 원본은 이 입력에 저장하지 않습니다. PDF·DOCX 자동 추출은 안전한 파일 검증 기능을 추가한 뒤 제공할 예정입니다.</p>
                     </div>
-                    <div className="space-y-2 rounded-lg bg-muted/40 p-4 text-sm">
-                      <div className="flex items-center gap-2">{profile?.resume ? <CheckCircle2 className="h-4 w-4 text-green-600" /> : <AlertCircle className="h-4 w-4 text-muted-foreground" />} 이력서 {profile?.resume ? "등록됨" : "미등록"}</div>
-                      <div className="flex items-center gap-2">{profile?.coverLetter ? <CheckCircle2 className="h-4 w-4 text-green-600" /> : <AlertCircle className="h-4 w-4 text-muted-foreground" />} 자기소개서 {profile?.coverLetter ? "등록됨" : "미등록"}</div>
+                    <div className="flex items-center gap-2 rounded-lg bg-muted/40 p-3 text-sm">
+                      {canMoveFromProfile ? <CheckCircle2 className="h-4 w-4 text-green-600" /> : <AlertCircle className="h-4 w-4 text-amber-600" />}
+                      {canMoveFromProfile ? "면접 질문을 만들 준비가 되었습니다." : "문서 하나를 붙여넣거나 회사와 직무를 모두 입력해주세요."}
                     </div>
-                    {!hasProfileMaterial && <div className="space-y-2"><p className="text-xs leading-5 text-amber-700 dark:text-amber-300">맞춤 질문을 만들려면 이력서 또는 자기소개서가 필요합니다. 등록 후 이 화면으로 돌아오세요.</p><Link href="/profile"><Button variant="outline" className="w-full">이력서·자소서 등록하기</Button></Link></div>}
-                    <Button className="w-full" onClick={saveSupportInfoAndContinue} disabled={!canMoveFromProfile || !hasProfileMaterial || profileUpsertMutation.isPending}>{profileUpsertMutation.isPending ? "저장 중..." : "지원 정보 저장 후 다음"}</Button>
+                    <Button className="w-full" onClick={saveSupportInfoAndContinue} disabled={!canMoveFromProfile || profileUpsertMutation.isPending}>{profileUpsertMutation.isPending ? "저장 중..." : "지원 정보 저장 후 다음"}</Button>
                   </div>
                 )}
 
@@ -2155,7 +2150,7 @@ export default function Interview() {
                 {setupStep === 5 && (
                   <div className="space-y-5">
                     <div><h2 className="text-xl font-semibold">면접 분량과 녹음 방식을 정해주세요</h2><p className="mt-2 text-sm leading-6 text-muted-foreground">질문 수와 답변 시간을 정합니다. 이력서·자소서 맞춤 질문은 면접 시작 후 한 개씩 생성됩니다.</p></div>
-                    <div><p className="mb-2 text-sm font-medium">질문 수</p><div className="grid grid-cols-3 gap-2">{[5, 8, 10].map((count) => <Button key={count} type="button" variant={totalQuestions === count ? "default" : "outline"} onClick={() => setTotalQuestions(count)}>{count}개</Button>)}</div><p className="mt-2 text-xs text-muted-foreground">5문항은 핵심 축약, 8문항은 전체 8개 파트를 한 번씩 연습합니다.</p></div>
+                    <div><p className="mb-2 text-sm font-medium">질문 수</p><div className="grid grid-cols-4 gap-2">{[3, 5, 8, 10].map((count) => <Button key={count} type="button" variant={totalQuestions === count ? "default" : "outline"} onClick={() => setTotalQuestions(count)}>{count}개</Button>)}</div><p className="mt-2 text-xs text-muted-foreground">3문항은 기본 크레딧으로 완주할 수 있고, 8문항은 전체 8개 파트를 한 번씩 연습합니다.</p></div>
                     <div><p className="mb-2 text-sm font-medium">질문당 답변 시간</p><div className="grid grid-cols-3 gap-2">{[60, 90, 120].map((seconds) => <Button key={seconds} type="button" variant={timerDuration === seconds ? "default" : "outline"} onClick={() => setTimerDuration(seconds)}>{seconds / 60}분</Button>)}</div></div>
                     {voiceMode && <>
                       <div><p className="mb-2 text-sm font-medium">녹음 방식</p><div className="grid gap-2 sm:grid-cols-2"><button type="button" className={`rounded-lg border p-3 text-left ${recordingMode === "manual" ? "border-primary bg-primary/5" : "hover:border-primary/50"}`} onClick={() => setRecordingMode("manual")}><p className="font-medium">수동 녹음</p><p className="mt-1 text-xs text-muted-foreground">마이크 버튼을 눌러 시작·종료</p></button><button type="button" className={`rounded-lg border p-3 text-left ${recordingMode === "automatic" ? "border-primary bg-primary/5" : "hover:border-primary/50"}`} onClick={() => setRecordingMode("automatic")}><p className="font-medium">자동 녹음</p><p className="mt-1 text-xs text-muted-foreground">질문 재생 후 자동 시작</p></button></div></div>
@@ -3932,7 +3927,7 @@ export default function Interview() {
           </CardHeader>
         </Card>
 
-        {status === "answering" && voiceMode && cameraEnabled && (
+        {(status === "answering" || status === "feedback") && voiceMode && cameraEnabled && (
           <InterviewMediaCheck audio={false} video autoStart compact />
         )}
 
@@ -4279,6 +4274,13 @@ export default function Interview() {
                 </div>
               </CardHeader>
               <CardContent className="space-y-4">
+                <InstantAnswerCorrection
+                  originalAnswer={currentQA.userAnswer || ""}
+                  correctedAnswer={currentQA.suggestedAnswer}
+                  correctedAnswerShort={currentQA.suggestedAnswerShort}
+                  correctedAnswerLong={currentQA.suggestedAnswerLong}
+                  improvements={currentQA.improvements}
+                />
                 <div className="bg-secondary/30 p-4 rounded-lg">
                   <p className="text-sm">{currentQA.userAnswer}</p>
                   
@@ -4463,38 +4465,6 @@ export default function Interview() {
                     </div>
                   )}
                 </div>
-
-                {/* 모범답안 버전 선택 */}
-                {(currentQA.suggestedAnswerShort || currentQA.suggestedAnswerLong || currentQA.suggestedAnswer) && (
-                  <div>
-                    <div className="flex items-center justify-between mb-2">
-                      <p className="text-sm font-medium text-primary">내 답변을 고친 예시</p>
-                      {currentQA.suggestedAnswerShort && currentQA.suggestedAnswerLong && (
-                        <div className="flex gap-2">
-                          <button
-                            onClick={() => setAnswerVersionPreference('short')}
-                            className={`text-xs px-2 py-1 rounded ${answerVersionPreference === 'short' ? 'bg-primary text-white' : 'bg-gray-100 text-gray-600'}`}
-                          >
-                            짧은 버전
-                          </button>
-                          <button
-                            onClick={() => setAnswerVersionPreference('long')}
-                            className={`text-xs px-2 py-1 rounded ${answerVersionPreference === 'long' ? 'bg-primary text-white' : 'bg-gray-100 text-gray-600'}`}
-                          >
-                            긴 버전
-                          </button>
-                        </div>
-                      )}
-                    </div>
-                    <div className="bg-primary/5 p-4 rounded-lg text-sm">
-                      <Streamdown>
-                        {answerVersionPreference === 'short' && currentQA.suggestedAnswerShort
-                          ? currentQA.suggestedAnswerShort
-                          : currentQA.suggestedAnswerLong || currentQA.suggestedAnswer || ''}
-                      </Streamdown>
-                    </div>
-                  </div>
-                )}
 
                 {/* 구체적인 개선 가이드 */}
                 {currentQA.improvementGuide && (
@@ -4767,9 +4737,14 @@ export default function Interview() {
               <Button 
                 onClick={handleNextQuestion}
                 className="gap-2 w-full sm:w-auto"
-                disabled={completeMutation.isPending}
+                disabled={completeMutation.isPending || generateMutation.isPending}
               >
-                {completeMutation.isPending ? (
+                {generateMutation.isPending ? (
+                  <>
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                    다음 질문 준비 중...
+                  </>
+                ) : completeMutation.isPending ? (
                   <Loader2 className="w-4 h-4 animate-spin" />
                 ) : questionIndex + 1 >= totalQuestions ? (
                   <>

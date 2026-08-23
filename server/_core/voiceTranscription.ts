@@ -138,7 +138,7 @@ export async function transcribeFromBuffer(
       baseUrl
     ).toString();
 
-    console.log(`[transcribeFromBuffer] Calling Whisper API: ${fullUrl}`);
+    console.info("[transcribeFromBuffer] provider request started");
 
     const response = await fetch(fullUrl, {
       method: "POST",
@@ -150,19 +150,21 @@ export async function transcribeFromBuffer(
     });
 
     if (!response.ok) {
-      const errorText = await response.text().catch(() => "");
-      console.error(`[transcribeFromBuffer] API error: ${response.status} ${response.statusText} - ${errorText}`);
+      await response.body?.cancel().catch(() => undefined);
+      console.error("[transcribeFromBuffer] provider request failed", {
+        status: response.status,
+      });
       return {
         error: "Transcription service request failed",
         code: "TRANSCRIPTION_FAILED",
-        details: `${response.status} ${response.statusText}${errorText ? `: ${errorText}` : ""}`
+        details: `HTTP ${response.status}`
       };
     }
 
     // Step 4: Parse and return the transcription result
     const whisperResponse = await response.json() as WhisperResponse;
     
-    console.log(`[transcribeFromBuffer] Success: "${whisperResponse.text?.substring(0, 50)}..."`);
+    console.info("[transcribeFromBuffer] provider request completed", { outcome: "success" });
     
     // Validate response structure
     if (!whisperResponse.text || typeof whisperResponse.text !== 'string') {
@@ -212,7 +214,7 @@ export async function transcribeAudio(
       };
     }
 
-    console.log(`[transcribeAudio] Downloading audio from: ${options.audioUrl}`);
+    console.info("[transcribeAudio] legacy URL transcription started");
 
     // Step 2: Download audio from URL
     let audioBuffer: Buffer;

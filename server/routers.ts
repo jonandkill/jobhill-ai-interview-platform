@@ -12,6 +12,7 @@ import {
   serializeInterviewPlan,
 } from "@shared/interviewFramework";
 import { getAnsweredUniqueFollowUps } from "@shared/interviewFollowUps";
+import { hasInterviewContext, hasInterviewDocument } from "@shared/interviewContext";
 import { PAYMENT_PRODUCTS, type PaymentProductType } from "@shared/products";
 import { getSessionCookieOptions } from "./_core/cookies";
 import { systemRouter } from "./_core/systemRouter";
@@ -31,10 +32,7 @@ function limitPromptText(value: unknown, maxLength = 5000): string {
 }
 
 export function hasInterviewProfileMaterial(profile: { resume?: unknown; coverLetter?: unknown } | null | undefined): boolean {
-  return Boolean(
-    (typeof profile?.resume === "string" && profile.resume.trim()) ||
-    (typeof profile?.coverLetter === "string" && profile.coverLetter.trim()),
-  );
+  return hasInterviewDocument(profile);
 }
 
 export function normalizeGeneratedQuestion(value: unknown, fallback: string): string {
@@ -62,7 +60,7 @@ export function normalizeGeneratedQuestion(value: unknown, fallback: string): st
 }
 
 const feedbackResponseSchema = z.object({
-  score: z.number().finite().min(0).max(100),
+  score: z.number().int().finite().min(0).max(100),
   feedback: z.string().min(1).max(5000),
   strengths: z.string().min(1).max(5000),
   improvements: z.string().min(1).max(5000),
@@ -71,11 +69,11 @@ const feedbackResponseSchema = z.object({
   improvementGuide: z.string().min(1).max(5000),
   followUpQuestions: z.array(z.string().min(1).max(500)).max(3).optional().default([]),
   rubricScores: z.object({
-    relevance: z.number().min(0).max(20),
-    evidence: z.number().min(0).max(20),
-    structure: z.number().min(0).max(20),
-    roleFit: z.number().min(0).max(20),
-    clarity: z.number().min(0).max(20),
+    relevance: z.number().int().min(0).max(20),
+    evidence: z.number().int().min(0).max(20),
+    structure: z.number().int().min(0).max(20),
+    roleFit: z.number().int().min(0).max(20),
+    clarity: z.number().int().min(0).max(20),
   }),
   evidenceQuotes: z.array(z.string().max(300)).max(3).optional().default([]),
   confidenceNote: z.string().max(500).optional(),
@@ -333,6 +331,10 @@ export const appRouter = router({  system: systemRouter,
         })),
       }))
       .mutation(async ({ ctx, input }) => {
+        const profile = await db.getUserProfile(ctx.user.id);
+        if (!profile || profile.id !== input.profileId) {
+          throw new TRPCError({ code: "NOT_FOUND", message: "자기소개서 항목을 찾을 수 없습니다." });
+        }
         return db.upsertCoverLetterItems(input.profileId, ctx.user.id, input.items);
       }),
     
@@ -540,6 +542,12 @@ export const appRouter = router({  system: systemRouter,
         }
         
         const profile = await db.getUserProfile(ctx.user.id);
+        if (!hasInterviewContext(profile)) {
+          throw new TRPCError({
+            code: "BAD_REQUEST",
+            message: "이력서·자기소개서를 등록하거나 지원 회사와 직무를 모두 입력해주세요.",
+          });
+        }
         
         const preparedQuestions = normalizePreparedQuestions(input.selectedQuestions);
         let interviewPlan: ReturnType<typeof buildInterviewPlan>;
@@ -553,6 +561,13 @@ export const appRouter = router({  system: systemRouter,
           throw new TRPCError({
             code: "BAD_REQUEST",
             message: error instanceof Error ? error.message : "면접 질문 순서를 구성할 수 없습니다.",
+          });
+        }
+
+        if (!subscription && !hasFreeTrial && (user.questionCredits || 0) < interviewPlan.length) {
+          throw new TRPCError({
+            code: "FORBIDDEN",
+            message: `질문 크레딧이 부족합니다. 현재 ${user.questionCredits || 0}개로는 ${interviewPlan.length}문항 면접을 시작할 수 없습니다.`,
           });
         }
 
@@ -631,8 +646,11 @@ export const appRouter = router({  system: systemRouter,
         }
 
         const profile = await db.getUserProfile(ctx.user.id);
-        if (!hasInterviewProfileMaterial(profile)) {
-          throw new Error("맞춤 질문을 만들려면 이력서 또는 자기소개서를 먼저 등록해주세요.");
+        if (!hasInterviewContext(profile)) {
+          throw new TRPCError({
+            code: "BAD_REQUEST",
+            message: "맞춤 질문을 만들려면 이력서·자기소개서를 등록하거나 지원 회사와 직무를 모두 입력해주세요.",
+          });
         }
         
         const existingQAs = await db.getSessionQAs(input.sessionId);
@@ -699,7 +717,10 @@ export const appRouter = router({  system: systemRouter,
         const styleReminder = speechStyle
           ? "중요: 질문을 작성할 때 위의 면접관 말투 스타일을 반드시 반영해주세요."
           : "";
-        const stageInstruction = `${currentPhase.label}: ${currentPhase.purpose}. ${currentPhase.promptGuide}`;
+        const phasePromptGuide = !hasResumeOrCoverLetter && (currentPhase.id === "resume" || currentPhase.id === "highlight")
+          ? "지원 직무의 핵심 역량을 보여주는 구체적인 경험과 본인의 역할·행동·결과를 묻는다."
+          : currentPhase.promptGuide;
+        const stageInstruction = `${currentPhase.label}: ${currentPhase.purpose}. ${phasePromptGuide}`;
 
         const prompt = [
           `당신은 ${profile?.targetCompany || "기업"}의 ${profile?.targetPosition || "직무"} 면접관입니다.`,
@@ -837,9 +858,9 @@ export const appRouter = router({  system: systemRouter,
         const profile = await db.getUserProfile(ctx.user.id);
         const perspective = "구조화 면접 평가 루브릭";
         
-        const answerStyleGuide = input.answerStyle === "short" 
-          ? "간결하고 핵심만 담은 1-2문장 모범답안"
-          : "상세하고 구체적인 예시를 포함한 3-5문장 모범답안";
+        const answerStyleGuide = input.answerStyle === "short"
+          ? "지원자의 원답 사실만 유지해 1-2문장으로 고친 답변"
+          : "지원자의 원답 사실만 유지해 3-5문장으로 구조화한 답변";
         
         const tensionGuide = input.tensionLevel === "high"
           ? "긴장도가 높은 사람을 위한 단순하고 외우기 쉬운 구조의 답변"
@@ -859,6 +880,7 @@ ${avatarFeedbackGuide}
 
 중요 원칙:
 - 답변에 없는 경력, 성과, 수치, 회사 정보는 만들지 마세요.
+- 고친 답변에는 지원자 원답에 실제로 있는 사실만 사용하세요. 꼭 필요한 사실이 빠졌다면 지어내지 말고 [보완할 사실]로 표시하세요.
 - 채용 합격 여부나 실제 합격 확률을 예측하지 마세요.
 - 동일한 답변에는 같은 평가 기준을 적용하세요.
 - 강점과 개선점마다 답변 원문에서 짧은 근거를 제시하세요.
@@ -870,7 +892,7 @@ ${avatarFeedbackGuide}
 - 지원 회사: ${profile?.targetCompany || "정보 없음"}
 - 지원 직무: ${profile?.targetPosition || "정보 없음"}
 
-모범답안 스타일: ${answerStyleGuide}
+교정 답변 스타일: ${answerStyleGuide}
 답변 특성: ${tensionGuide}
 
 평가 루브릭 (각 0~20점, 합계 100점):
@@ -886,8 +908,8 @@ ${avatarFeedbackGuide}
 3. feedback: 답변에 근거한 전반적인 피드백
 3. strengths: 답변의 강점 (구체적으로 2-3가지)
 4. improvements: 개선이 필요한 부분 (구체적인 개선 방법과 함께 2-3가지)
-5. suggestedAnswerShort: 짧은 버전 모범 답안 (1-2문장, 핵심만)
-6. suggestedAnswerLong: 긴 버전 모범 답안 (3-5문장, 상세한 예시 포함)
+5. suggestedAnswerShort: 원답의 사실을 유지하며 구조와 표현을 고친 짧은 답변 (1-2문장)
+6. suggestedAnswerLong: 원답의 사실을 유지하며 구조와 표현을 고친 긴 답변 (3-5문장, 없는 정보는 [보완할 사실])
 7. improvementGuide: 다음 재연습에서 바로 적용할 3단계 행동 가이드
 8. evidenceQuotes: 판단 근거가 된 답변 원문 짧은 구절 1~3개
 9. confidenceNote: 답변 정보가 부족해 판단하기 어려운 부분
@@ -4261,20 +4283,27 @@ JSON 형식으로 다음을 제공해주세요:
     // 음성 파일 업로드 및 텍스트 변환 (S3 업로드 없이 직접 처리)
     transcribe: protectedProcedure
       .input(z.object({
+        sessionId: z.number().int().positive(),
         audioBase64: z.string().min(1).max(17_000_000), // 약 12MB 오디오의 Base64 상한
         mimeType: z.enum(["audio/webm", "audio/ogg", "audio/mp4", "audio/mpeg", "audio/wav"]).default("audio/webm"),
         language: z.enum(["ko", "en"]).optional(),
       }))
       .mutation(async ({ input, ctx }) => {
+        const session = await requireOwnedInterviewSession(ctx.user.id, input.sessionId);
+        if (!session.isVoiceMode) {
+          throw new TRPCError({ code: "FORBIDDEN", message: "음성 면접 세션에서만 음성 변환을 사용할 수 있습니다." });
+        }
         const { transcribeFromBuffer } = await import("./_core/voiceTranscription");
         
         try {
-          console.log(`[voice.transcribe] User ${ctx.user.id} - Base64 길이: ${input.audioBase64.length}, mimeType: ${input.mimeType}`);
-          
-          // Base64 디코딩
-          const audioBuffer = Buffer.from(input.audioBase64, "base64");
-          
-          console.log(`[voice.transcribe] 오디오 버퍼 크기: ${audioBuffer.length} bytes`);
+          const encodedAudio = input.audioBase64.trim();
+          if (encodedAudio.length % 4 !== 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(encodedAudio)) {
+            throw new TRPCError({ code: "BAD_REQUEST", message: "올바른 Base64 오디오가 아닙니다." });
+          }
+          const audioBuffer = Buffer.from(encodedAudio, "base64");
+          if (audioBuffer.length === 0) {
+            throw new TRPCError({ code: "BAD_REQUEST", message: "오디오 데이터가 비어 있습니다." });
+          }
           
           // JSON Base64 오버헤드를 고려해 12MB로 제한합니다.
           const sizeMB = audioBuffer.length / (1024 * 1024);
@@ -4292,17 +4321,22 @@ JSON 형식으로 다음을 제공해주세요:
           
           // 에러 체크
           if ("error" in result) {
-            console.error("[voice.transcribe] Whisper API 오류:", result);
-            throw new Error(`${result.error}${result.details ? `: ${result.details}` : ""}`);
+            console.error("[voice.transcribe] provider failure", { code: result.code });
+            throw new Error(result.error);
           }
           
-          console.log(`[voice.transcribe] 성공: "${result.text?.substring(0, 50)}..."`);
+          console.info("[voice.transcribe] completed", {
+            userId: ctx.user.id,
+            sessionId: input.sessionId,
+            byteLength: audioBuffer.length,
+            mimeType: input.mimeType,
+            outcome: "success",
+          });
           
           return {
             text: result.text,
             language: result.language,
             duration: result.duration,
-            segments: result.segments,
           };
         } catch (error) {
           console.error("[voice.transcribe] 오류:", error);

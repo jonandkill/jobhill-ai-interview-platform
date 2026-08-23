@@ -1,4 +1,5 @@
 import { useAuth } from "@/_core/hooks/useAuth";
+import { hasInterviewContext } from "@shared/interviewContext";
 import DashboardLayout from "@/components/DashboardLayout";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -37,14 +38,10 @@ export default function Dashboard() {
     .slice()
     .reverse();
   const inProgressSession = sessions.find(session => session.status === "in_progress");
-  const profileReady = Boolean(
-    profile?.targetCompany &&
-    profile?.targetPosition &&
-    (profile?.resume || profile?.coverLetter),
-  );
+  const profileReady = hasInterviewContext(profile);
 
   const lifecycle = [
-    { title: "지원 정보 준비", description: "회사·직무와 이력서 또는 자기소개서", complete: profileReady, icon: FileText },
+    { title: "지원 정보 준비", description: "이력서·자소서 또는 회사·직무", complete: profileReady, icon: FileText },
     { title: "첫 모의면접", description: "카메라·마이크 점검 후 실제처럼 답변", complete: sessions.length > 0, icon: Mic },
     { title: "근거 기반 피드백", description: "답변별 강점과 다음 수정 포인트 확인", complete: completedSessions.length > 0, icon: FileSearch },
     { title: "수정 후 재연습", description: "같은 직무로 다시 답해 변화 확인", complete: completedSessions.length > 1, icon: RotateCcw },
@@ -54,7 +51,7 @@ export default function Dashboard() {
   const nextAction = inProgressSession
     ? { eyebrow: "이어서 하기", title: "진행 중인 면접을 마무리하세요", description: "기존 답변과 설정을 유지한 채 다음 질문부터 이어갑니다.", href: `/interview/${inProgressSession.id}`, label: "면접 이어가기", icon: ArrowRight }
     : !profileReady
-      ? { eyebrow: "1단계", title: "맞춤 질문의 기준부터 만들어볼까요?", description: "지원 회사·직무와 이력서 또는 자기소개서를 등록하면 질문과 피드백이 내 경험을 기준으로 생성됩니다.", href: "/profile", label: "지원 정보 등록", icon: FileText }
+      ? { eyebrow: "1단계", title: "맞춤 질문의 기준부터 만들어볼까요?", description: "이력서·자소서를 등록하거나 회사와 직무를 입력하면 맞춤 질문을 시작할 수 있습니다.", href: "/profile", label: "지원 정보 등록", icon: FileText }
       : completedSessions.length === 0
         ? { eyebrow: "2단계", title: "첫 모의면접을 시작할 준비가 됐어요", description: "카메라는 셀프뷰에만 사용하고, 시작 전에 카메라와 마이크를 직접 점검합니다.", href: "/interview", label: "첫 면접 시작", icon: Mic }
         : completedSessions.length === 1

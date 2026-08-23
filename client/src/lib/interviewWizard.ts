@@ -20,7 +20,8 @@ export function canContinueInterviewWizard(input: {
   position: string;
   hasProfileMaterial: boolean;
 }): boolean {
-  return Boolean(input.company.trim() && input.position.trim() && input.hasProfileMaterial);
+  const hasCompleteTarget = Boolean(input.company.trim() && input.position.trim());
+  return input.hasProfileMaterial || hasCompleteTarget;
 }
 
 export function getQuestionRecoveryMessage(timedOut: boolean): string {
