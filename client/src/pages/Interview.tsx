@@ -64,7 +64,7 @@ import {
   EmotionType,
   getEmotionByScore
 } from "@/components/InterviewerAvatar";
-import { useState, useEffect, useCallback, useRef, type ChangeEvent } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { createPortal } from "react-dom";
 import { RadarChart, PolarGrid, PolarAngleAxis, PolarRadiusAxis, Radar, ResponsiveContainer, Tooltip } from "recharts";
 import {
@@ -88,6 +88,7 @@ import { toast } from "sonner";
 import { Link, useLocation } from "wouter";
 import { Streamdown } from "streamdown";
 import { correctSpeechText, generateSpeechHintMessage } from "@/lib/speechDictionary";
+import { cleanRecognizedTranscript, mergeRecognizedSpeech } from "@/lib/transcriptAnalysis";
 import { normalizeTranscriptionAudioMimeType, selectInterviewAudioMimeType } from "@/lib/interviewAudioCapture";
 import { escapeHtml, escapeHtmlWithBreaks } from "@/lib/safeHtml";
 import {
@@ -276,7 +277,7 @@ export default function Interview() {
   const [wizardCoverLetter, setWizardCoverLetter] = useState("");
   const [planMode, setPlanMode] = useState<"structured" | "selected_only">("structured");
   const [recordingMode, setRecordingMode] = useState<"manual" | "automatic">("manual");
-  const [silenceThreshold, setSilenceThreshold] = useState(3);
+  const silenceThreshold = 8;
   const questionGenerationTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const questionGenerationRequestRef = useRef(0);
   const [currentQA, setCurrentQA] = useState<QAItem | null>(null);
@@ -300,6 +301,8 @@ export default function Interview() {
   const [usageLimitReason, setUsageLimitReason] = useState<"voice_limit" | "usage_limit" | null>(null);
   const [isListening, setIsListening] = useState(false);
   const [speechRecognition, setSpeechRecognition] = useState<any>(null);
+  const listeningRequestedRef = useRef(false);
+  const recognitionRestartTimerRef = useRef<number | null>(null);
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [ttsEnabled, setTtsEnabled] = useState(true);
   const [ttsSpeed, setTtsSpeed] = useState(0.98); // 0.8 ~ 1.5, 기본값 1.15배속
@@ -468,12 +471,11 @@ export default function Interview() {
   const whisperTranscribeMutation = trpc.voice.transcribe.useMutation({
     onSuccess: (data) => {
       if (data.text) {
-        setAnswer(prev => {
-          const newAnswer = prev + (prev ? ' ' : '') + data.text.trim();
-          return newAnswer;
-        });
-        setInterimTranscript('');
-        toast.success('음성 인식 완료!');
+        // 한 답변의 전체 녹음을 다시 판독한 결과이므로 기존 초안에 덧붙이지 않습니다.
+        // 모바일 누적 가설에서 생긴 비정상 반복만 보수적으로 정리합니다.
+        setAnswer(cleanRecognizedTranscript(data.text));
+        setInterimTranscript("");
+        toast.success("답변을 글로 옮겼습니다. 제출 전에 확인해주세요.");
       }
       setIsTranscribing(false);
     },
@@ -644,9 +646,15 @@ export default function Interview() {
           if (rms > 0.035) {
             hasSpeech = true;
             lastSoundAt = Date.now();
-          } else if (hasSpeech && (Date.now() - lastSoundAt) / 1000 >= silenceThreshold && recorder.state !== "inactive") {
-            toast.info(`${silenceThreshold}초 동안 음성이 없어 답변을 마칩니다.`);
-            recorder.stop();
+            setLastSpeechTime(lastSoundAt);
+            setShowSilenceWarning(false);
+          } else if (
+            hasSpeech &&
+            (Date.now() - lastSoundAt) / 1000 >= silenceThreshold &&
+            recorder.state !== "inactive"
+          ) {
+            // 침묵은 생각하는 시간일 수 있으므로 답변을 자동 종료하지 않습니다.
+            setShowSilenceWarning(true);
           }
         }, 250);
       }
@@ -750,124 +758,100 @@ export default function Interview() {
     }
   }, [voiceMode]);
 
-  // 음성 인식 초기화
+  // 서버 전사를 사용할 수 없을 때의 브라우저 음성 인식 보조 경로
   useEffect(() => {
-    if (typeof window !== 'undefined') {
-      const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-      if (SpeechRecognition) {
-        const recognition = new SpeechRecognition();
-        recognition.lang = 'ko-KR';
-        // 모바일 호환성: iOS Safari는 continuous 모드를 지원하지 않음
-        const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
-        const isIOS = /iPhone|iPad|iPod/i.test(navigator.userAgent);
-        
-        // iOS에서는 continuous와 interimResults 모두 false로 설정
-        recognition.continuous = isIOS ? false : !isMobile;
-        recognition.interimResults = isIOS ? false : true; // iOS는 interimResults 지원 안됨
-        recognition.maxAlternatives = 1;
-        
-        recognition.onresult = (event: any) => {
-          console.log('[SpeechRecognition] onresult event received:', event.results.length, 'results');
-          let finalTranscript = '';
-          let interim = '';
-          
-          for (let i = event.resultIndex; i < event.results.length; i++) {
-            const result = event.results[i];
-            const transcript = result[0]?.transcript || '';
-            const confidence = result[0]?.confidence || 0;
-            const isFinal = result.isFinal;
-            
-            // iOS에서는 모든 결과를 final로 처리
-            if (isFinal || isIOS) {
-              finalTranscript += transcript;
-            } else {
-              interim += transcript;
-            }
-          }
-          
-          // 중간 결과 실시간 표시 - 즉시 업데이트
-          if (interim) {
-            setInterimTranscript(interim);
-          }
-          
-          if (finalTranscript) {
-            // 전문 용어 사전으로 교정
-            const correctedTranscript = correctSpeechText(finalTranscript);
-            setAnswer(prev => {
-              const newAnswer = prev + (prev ? ' ' : '') + correctedTranscript;
-              // 모바일에서 텍스트 입력 필드에 반영되도록 강제 업데이트
-              return newAnswer;
-            });
-            setInterimTranscript(''); // 최종 결과 후 중간 결과 초기화
-            
-            // 모바일에서 성공 피드백
-            if (isMobile) {
-              toast.success('음성이 텍스트로 변환되었습니다!', { duration: 1500 });
-            }
-            
-            // 실시간 피드백: 마지막 음성 감지 시간 업데이트
-            setLastSpeechTime(Date.now());
-            setShowSilenceWarning(false);
-            setSilenceTimer(0);
-          }
-        };
-        
-        recognition.onerror = (event: any) => {
-          console.error('Speech recognition error:', event.error);
-          // 모바일에서 no-speech 오류는 자동 재시작
-          if (isMobile && event.error === 'no-speech') {
-            console.log('[SpeechRecognition] Mobile no-speech, will restart');
-            return; // onend에서 재시작 처리
-          }
-          setIsListening(false);
-          switch (event.error) {
-            case 'not-allowed':
-              toast.error('마이크 권한이 거부되었습니다. 브라우저 설정에서 마이크 권한을 허용해주세요.');
-              break;
-            case 'no-speech':
-              toast.info('음성이 감지되지 않았습니다. 다시 시도해주세요.');
-              break;
-            case 'audio-capture':
-              toast.error('마이크를 찾을 수 없습니다. 마이크가 연결되어 있는지 확인해주세요.');
-              break;
-            case 'network':
-              toast.error('네트워크 오류가 발생했습니다. 인터넷 연결을 확인해주세요.');
-              break;
-            case 'aborted':
-              // 사용자가 중단한 경우 메시지 없음
-              break;
-            default:
-              toast.error('음성 인식 오류: ' + event.error);
-          }
-        };
-        
-        recognition.onend = () => {
-          console.log('[SpeechRecognition] onend called, isListening:', isListening);
-          // 모바일에서 자동 재시작 (듣기 중이면)
-          if (isMobile && isListening) {
-            console.log('[SpeechRecognition] Mobile auto-restart');
-            // 약간의 지연 후 재시작 (iOS 호환성)
-            setTimeout(() => {
-              try {
-                recognition.start();
-                console.log('[SpeechRecognition] Restarted successfully');
-              } catch (e) {
-                console.log('[SpeechRecognition] Restart failed:', e);
-                setIsListening(false);
-              }
-            }, isIOS ? 500 : 100); // iOS는 더 긴 지연 필요
-          } else {
-            setIsListening(false);
-          }
-        };
-        
-        setSpeechRecognition(recognition);
-      }
-    }
-  }, [isListening]);
+    if (typeof window === "undefined") return;
 
-  // 음성 인식 시작/중지 핸들러
-  // Whisper API 기반 음성 녹음 시작/중지
+    const SpeechRecognition =
+      (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (!SpeechRecognition) return;
+
+    const recognition = new SpeechRecognition();
+    const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+    const isIOS = /iPhone|iPad|iPod/i.test(navigator.userAgent);
+
+    recognition.lang = "ko-KR";
+    recognition.continuous = !isMobile;
+    recognition.interimResults = !isIOS;
+    recognition.maxAlternatives = 1;
+
+    recognition.onresult = (event: any) => {
+      let finalTranscript = "";
+      let interim = "";
+
+      for (let index = event.resultIndex; index < event.results.length; index += 1) {
+        const result = event.results[index];
+        const transcript = result[0]?.transcript || "";
+        if (result.isFinal || isIOS) finalTranscript += transcript;
+        else interim += transcript;
+      }
+
+      setInterimTranscript(cleanRecognizedTranscript(interim));
+      if (finalTranscript) {
+        const corrected = correctSpeechText(finalTranscript);
+        setAnswer(previous => mergeRecognizedSpeech(previous, corrected));
+        setInterimTranscript("");
+        setLastSpeechTime(Date.now());
+        setShowSilenceWarning(false);
+      }
+    };
+
+    recognition.onerror = (event: any) => {
+      const recoverable = event.error === "no-speech" || event.error === "aborted";
+      if (recoverable && listeningRequestedRef.current) return;
+
+      listeningRequestedRef.current = false;
+      setIsListening(false);
+      switch (event.error) {
+        case "not-allowed":
+          toast.error("마이크 권한을 허용한 뒤 다시 눌러주세요.");
+          break;
+        case "audio-capture":
+          toast.error("마이크를 사용할 수 없습니다. 다른 앱의 통화를 종료한 뒤 다시 시도해주세요.");
+          break;
+        case "network":
+          toast.error("연결이 불안정합니다. 말로 답변 입력을 다시 눌러주세요.");
+          break;
+        default:
+          toast.error("말씀을 이어받지 못했습니다. 버튼을 눌러 다시 연결해주세요.");
+      }
+    };
+
+    recognition.onend = () => {
+      if (!listeningRequestedRef.current) {
+        setIsListening(false);
+        return;
+      }
+
+      // 모바일 브라우저의 짧은 세션 종료는 답변 완료가 아닙니다.
+      recognitionRestartTimerRef.current = window.setTimeout(() => {
+        try {
+          recognition.start();
+        } catch {
+          listeningRequestedRef.current = false;
+          setIsListening(false);
+          toast.error("마이크 연결이 끊겼습니다. 말로 답변 입력을 다시 눌러주세요.");
+        }
+      }, isIOS ? 500 : 320);
+    };
+
+    setSpeechRecognition(recognition);
+    return () => {
+      listeningRequestedRef.current = false;
+      if (recognitionRestartTimerRef.current) {
+        window.clearTimeout(recognitionRestartTimerRef.current);
+        recognitionRestartTimerRef.current = null;
+      }
+      recognition.onend = null;
+      try {
+        recognition.abort();
+      } catch {
+        // 이미 종료된 인식기는 별도 정리가 필요하지 않습니다.
+      }
+    };
+  }, []);
+
+  // 말로 답변 시작/종료
   const toggleListening = async () => {
     if (useWhisperApi) {
       if (mediaRecorderRef.current?.state === "recording" || isRecording) {
@@ -879,23 +863,29 @@ export default function Interview() {
     }
 
     if (!speechRecognition) {
-      toast.error("이 브라우저는 음성 인식을 지원하지 않습니다. 텍스트로 답변해주세요.");
+      toast.error("이 브라우저에서는 말로 답변을 받을 수 없습니다. 직접 입력해주세요.");
       return;
     }
+
     try {
       if (isListening) {
+        listeningRequestedRef.current = false;
+        if (recognitionRestartTimerRef.current) {
+          window.clearTimeout(recognitionRestartTimerRef.current);
+          recognitionRestartTimerRef.current = null;
+        }
         speechRecognition.stop();
         setIsListening(false);
       } else {
-        // 별도 getUserMedia 권한 점검은 장치 해제 경합을 만들 수 있어 SpeechRecognition 오류 처리에 맡깁니다.
+        listeningRequestedRef.current = true;
         speechRecognition.start();
         setIsListening(true);
-        toast.success("음성 인식을 시작합니다.");
+        toast.success("말씀해주세요. 답변이 끝나면 답변 종료를 눌러주세요.");
       }
-    } catch (error) {
-      console.error("Speech recognition lifecycle error:", error);
+    } catch {
+      listeningRequestedRef.current = false;
       setIsListening(false);
-      toast.error("음성 인식을 시작하지 못했습니다.");
+      toast.error("마이크를 시작하지 못했습니다. 권한을 확인해주세요.");
     }
   };
 
@@ -1126,10 +1116,10 @@ export default function Interview() {
     toast.success('인쇄 다이얼로그에서 "PDF로 저장"을 선택하세요!');
   };
 
-  // TTS(Text-to-Speech) 함수 - 서버 Edge TTS API 사용 (아바타별 다른 목소리)
+  // 사설 자연 음성 서버에서 면접 질문을 일회성으로 생성합니다.
   const [currentAudio, setCurrentAudio] = useState<HTMLAudioElement | null>(null);
   const [isTTSLoading, setIsTTSLoading] = useState(false);
-  const [ttsProviderStatus, setTtsProviderStatus] = useState<'idle' | 'loading' | 'supertonic2' | 'edge-tts' | 'web-speech' | 'text'>('idle');
+  const [ttsProviderStatus, setTtsProviderStatus] = useState<'idle' | 'loading' | 'supertonic2' | 'text'>('idle');
   const [audioContextActivated, setAudioContextActivated] = useState(false);
   const [showVoiceTestDialog, setShowVoiceTestDialog] = useState(false);
   const [voiceTestPassed, setVoiceTestPassed] = useState(false);
@@ -1205,7 +1195,7 @@ export default function Interview() {
         pitch: pitchStr,
       });
       
-      setTtsProviderStatus(result.provider === 'supertonic2' ? 'supertonic2' : 'edge-tts');
+      setTtsProviderStatus('supertonic2');
 
       // 오디오 재생
       const audio = new Audio(result.audioUrl);
@@ -1259,71 +1249,40 @@ export default function Interview() {
       await audio.play();
       setIsTTSLoading(false);
     } catch (error: any) {
-      console.error('[TTS] Edge TTS 실패, Web Speech API로 폴백:', error);
-      
-      // TTS 오류 로그 기록
+      console.error("[TTS] NATURAL_VOICE_UNAVAILABLE", {
+        message: error?.message || "TTS_UNAVAILABLE",
+      });
+
       logTTSErrorMutation.mutate({
-        errorMessage: error.message || '알 수 없는 오류',
-        errorType: 'edge_tts_failure',
-        questionText: text.substring(0, 500), // 최대 500자
+        errorMessage: error?.message || "TTS_UNAVAILABLE",
+        errorType: "natural_tts_failure",
         voiceType: selectedAvatar.voiceType,
         sessionId: sessionId || undefined,
       });
-      
-      // 폴백: Web Speech API 사용
-      try {
-        setTtsProviderStatus('web-speech');
-        const utterance = new SpeechSynthesisUtterance(text);
-        utterance.lang = 'ko-KR';
-        utterance.rate = ttsSpeed;
-        utterance.pitch = 1.0;
-        utterance.volume = 1.0;
-        
-        utterance.onend = async () => {
-          console.log('[TTS] Web Speech API 음성 재생 완료');
-          setIsSpeaking(false);
-          
-          // AI 음성 완료 후 타이머 시작
-          if (voiceMode && timerEnabled && status === 'answering') {
-            const duration = autoTimerEnabled ? getAutoTimerDuration(text) : timerDuration;
-            console.log('[타이머] AI 음성 완료 후 타이머 시작:', duration, '초');
-            setTimeRemaining(duration);
-            setTimerActive(true);
-            setTimerOvertime(false);
-            setOvertimeSeconds(0);
-          }
-          
-          // 음성 면접 안내 메시지
-          if (voiceMode) {
-            if (recordingMode === "automatic") {
-              toast.info('질문 읽기 완료! 자동으로 녹음을 시작합니다.', { duration: 2000 });
-              if (autoRecordTimeoutRef.current) clearTimeout(autoRecordTimeoutRef.current);
-            autoRecordTimeoutRef.current = window.setTimeout(() => {
-              autoRecordTimeoutRef.current = null;
-              if (statusRef.current === "answering") void startRecording();
-            }, 500);
-            } else {
-              toast.info('질문 읽기 완료! 마이크 버튼을 눌러 답변해주세요.', { duration: 3000 });
-            }
-          }
-        };
-        
-        utterance.onerror = (event) => {
-          console.error('[TTS] Web Speech API 오류:', event);
-          toast.error('음성 재생에 실패했습니다. 텍스트로 진행해주세요.');
-          setIsSpeaking(false);
-          setIsTTSLoading(false);
-        };
-        
-        window.speechSynthesis.speak(utterance);
-        setIsTTSLoading(false);
-        toast.info('기본 음성으로 재생합니다.', { duration: 2000 });
-      } catch (fallbackError) {
-        console.error('[TTS] 폴백도 실패:', fallbackError);
-        setTtsProviderStatus('text');
-        toast.error('음성 재생에 실패했습니다. 텍스트로 진행해주세요.');
-        setIsSpeaking(false);
-        setIsTTSLoading(false);
+
+      // 기기 합성음은 음질 편차가 커서 사용하지 않습니다. 질문은 화면에 유지합니다.
+      setTtsProviderStatus("text");
+      setIsSpeaking(false);
+      setIsTTSLoading(false);
+      toast.info("질문을 화면에서 확인해주세요. 기기 합성음은 재생하지 않습니다.", {
+        duration: 3000,
+      });
+
+      if (voiceMode && timerEnabled && status === "answering") {
+        const duration = autoTimerEnabled ? getAutoTimerDuration(text) : timerDuration;
+        setTimeRemaining(duration);
+        setTimerActive(true);
+        setTimerOvertime(false);
+        setOvertimeSeconds(0);
+      }
+
+      if (voiceMode && recordingMode === "automatic") {
+        const readingDelay = Math.max(2500, Math.min(9000, text.length * 110));
+        if (autoRecordTimeoutRef.current) clearTimeout(autoRecordTimeoutRef.current);
+        autoRecordTimeoutRef.current = window.setTimeout(() => {
+          autoRecordTimeoutRef.current = null;
+          if (statusRef.current === "answering") void startRecording();
+        }, readingDelay);
       }
     }
   };
@@ -1340,21 +1299,9 @@ export default function Interview() {
       currentAudio.pause();
       currentAudio.currentTime = 0;
     }
-    if (typeof window !== "undefined" && "speechSynthesis" in window) {
-      window.speechSynthesis.cancel();
-    }
     setIsSpeaking(false);
   };
 
-  // 음성 목록 로드 (일부 브라우저에서 필요)
-  useEffect(() => {
-    if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
-      // 음성 목록이 비동기로 로드되는 경우를 위해
-      window.speechSynthesis.onvoiceschanged = () => {
-        window.speechSynthesis.getVoices();
-      };
-    }
-  }, []);
   // voiceMode 변경 시 localStorage에 저장
   useEffect(() => {
     if (typeof window !== "undefined") {
@@ -2152,8 +2099,8 @@ export default function Interview() {
                     <div><p className="mb-2 text-sm font-medium">질문 수</p><div className="grid grid-cols-4 gap-2">{[3, 5, 8, 10].map((count) => <Button key={count} type="button" variant={totalQuestions === count ? "default" : "outline"} onClick={() => setTotalQuestions(count)}>{count}개</Button>)}</div><p className="mt-2 text-xs text-muted-foreground">3문항은 기본 크레딧으로 완주할 수 있고, 8문항은 전체 8개 파트를 한 번씩 연습합니다.</p></div>
                     <div><p className="mb-2 text-sm font-medium">질문당 답변 시간</p><div className="grid grid-cols-3 gap-2">{[60, 90, 120].map((seconds) => <Button key={seconds} type="button" variant={timerDuration === seconds ? "default" : "outline"} onClick={() => setTimerDuration(seconds)}>{seconds / 60}분</Button>)}</div></div>
                     {voiceMode && <>
-                      <div><p className="mb-2 text-sm font-medium">녹음 방식</p><div className="grid gap-2 sm:grid-cols-2"><button type="button" className={`rounded-lg border p-3 text-left ${recordingMode === "manual" ? "border-primary bg-primary/5" : "hover:border-primary/50"}`} onClick={() => setRecordingMode("manual")}><p className="font-medium">수동 녹음</p><p className="mt-1 text-xs text-muted-foreground">마이크 버튼을 눌러 시작·종료</p></button><button type="button" className={`rounded-lg border p-3 text-left ${recordingMode === "automatic" ? "border-primary bg-primary/5" : "hover:border-primary/50"}`} onClick={() => setRecordingMode("automatic")}><p className="font-medium">자동 녹음</p><p className="mt-1 text-xs text-muted-foreground">질문 재생 후 자동 시작</p></button></div></div>
-                      <div><div className="mb-2 flex items-center justify-between"><p className="text-sm font-medium">침묵 감지</p><span className="text-sm text-muted-foreground">{silenceThreshold}초</span></div><input aria-label="침묵 감지 시간" type="range" min="2" max="5" step="1" value={silenceThreshold} onChange={(event: ChangeEvent<HTMLInputElement>) => setSilenceThreshold(Number(event.target.value))} className="w-full accent-primary" /><p className="mt-1 text-xs text-muted-foreground">말이 멈춘 뒤 설정한 시간이 지나면 답변을 제출합니다.</p></div>
+                      <div><p className="mb-2 text-sm font-medium">녹음 방식</p><div className="grid gap-2 sm:grid-cols-2"><button type="button" className={`rounded-lg border p-3 text-left ${recordingMode === "manual" ? "border-primary bg-primary/5" : "hover:border-primary/50"}`} onClick={() => setRecordingMode("manual")}><p className="font-medium">수동 녹음</p><p className="mt-1 text-xs text-muted-foreground">마이크 버튼을 눌러 시작·종료</p></button><button type="button" className={`rounded-lg border p-3 text-left ${recordingMode === "automatic" ? "border-primary bg-primary/5" : "hover:border-primary/50"}`} onClick={() => setRecordingMode("automatic")}><p className="font-medium">자동 녹음</p><p className="mt-1 text-xs text-muted-foreground">질문 뒤 자동 시작 · 답변 종료는 직접 선택</p></button></div></div>
+                      <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/5 p-3"><p className="text-sm font-medium">답변이 끝날 때까지 계속 듣습니다</p><p className="mt-1 text-xs text-muted-foreground">생각하는 동안 잠시 멈춰도 종료되지 않습니다. 답변 종료 버튼을 눌렀을 때만 글로 옮깁니다.</p></div>
                       <div>
                         <p className="mb-2 text-sm font-medium">면접관 음성 배속 선택</p>
                         <div className="grid grid-cols-4 gap-2">
@@ -2178,7 +2125,7 @@ export default function Interview() {
                 {setupStep === 6 && (
                   <div className="space-y-5">
                     <div><h2 className="text-xl font-semibold">준비가 끝났습니다</h2><p className="mt-2 text-sm leading-6 text-muted-foreground">시작하기를 누르면 질문을 한 개씩 준비합니다. 질문이 늦어져도 재시도하거나 설정으로 돌아갈 수 있습니다.</p></div>
-                    <div className="space-y-2 rounded-lg bg-muted/40 p-4 text-sm"><p>지원 정보: <span className="font-medium">{wizardCompany} · {wizardPosition}</span></p><p>질문 흐름: <span className="font-medium">{planMode === "selected_only" ? "선택 질문 1개 재연습" : "구조화 면접 8단계"}</span></p><p>사전 질문: <span className="font-medium">{selectedQuestions.length}개</span></p><p>면접 방식: <span className="font-medium">{voiceMode ? "음성" : "텍스트"}</span></p><p>면접관: <span className="font-medium">{selectedAvatar.name}</span></p><p>기본 분량: <span className="font-medium">{totalQuestions}문항 · {timerDuration / 60}분</span></p>{voiceMode && <p>녹음: <span className="font-medium">{recordingMode === "automatic" ? `자동 · ${silenceThreshold}초 침묵 감지` : "수동"}</span></p>}</div>
+                    <div className="space-y-2 rounded-lg bg-muted/40 p-4 text-sm"><p>지원 정보: <span className="font-medium">{wizardCompany} · {wizardPosition}</span></p><p>질문 흐름: <span className="font-medium">{planMode === "selected_only" ? "선택 질문 1개 재연습" : "구조화 면접 8단계"}</span></p><p>사전 질문: <span className="font-medium">{selectedQuestions.length}개</span></p><p>면접 방식: <span className="font-medium">{voiceMode ? "음성" : "텍스트"}</span></p><p>면접관: <span className="font-medium">{selectedAvatar.name}</span></p><p>기본 분량: <span className="font-medium">{totalQuestions}문항 · {timerDuration / 60}분</span></p>{voiceMode && <p>녹음: <span className="font-medium">{recordingMode === "automatic" ? "질문 뒤 자동 시작 · 직접 종료" : "직접 시작 · 직접 종료"}</span></p>}</div>
                     {voiceMode && (
                       <div className="space-y-3">
                         <div className="flex items-center justify-between gap-4 rounded-lg border p-3">
@@ -3800,7 +3747,7 @@ export default function Interview() {
                   </Button>
                   {ttsProviderStatus !== 'idle' && (
                     <span className="text-[11px] text-muted-foreground" aria-live="polite">
-                      {ttsProviderStatus === 'loading' ? '음성 준비 중' : ttsProviderStatus === 'supertonic2' ? 'Supertonic2' : ttsProviderStatus === 'edge-tts' ? 'Edge TTS' : ttsProviderStatus === 'web-speech' ? '브라우저 음성 폴백' : '텍스트 진행'}
+                      {ttsProviderStatus === 'loading' ? '면접관 음성 준비 중' : ttsProviderStatus === 'supertonic2' ? '자연 음성' : '화면 질문'}
                     </span>
                   )}
                   <Button
@@ -4056,7 +4003,7 @@ export default function Interview() {
                     ) : isRecording ? (
                       <p className="text-sm font-medium text-red-600 flex items-center justify-center gap-2">
                         <span className="w-3 h-3 bg-red-500 rounded-full animate-pulse" />
-                        녹음 중... 말씀해주세요
+                        목소리가 들어오고 있습니다 · 끝나면 답변 종료를 눌러주세요
                       </p>
                     ) : (
                       <div className="space-y-2">
