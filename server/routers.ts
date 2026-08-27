@@ -144,55 +144,41 @@ function requireConfiguredSecret(value: string, name: string): string {
 
 export const appRouter = router({  system: systemRouter,
   
-  // TTS 관련
+  // 자연 음성 질문: 사설 Qwen3-TTS → 사설 Supertonic 3만 사용합니다.
   tts: router({
     generate: protectedProcedure
       .input(z.object({
-        text: z.string().min(1).max(5000),
-        voiceType: z.string(),
-        rate: z.string().optional(), // 예: '+20%', '-10%'
-        pitch: z.string().optional(), // 예: '+5Hz', '-10Hz'
+        text: z.string().trim().min(1).max(5000),
+        voiceType: z.string().trim().min(1).max(40),
+        rate: z.string().optional(),
+        pitch: z.string().optional(), // 이전 클라이언트 계약 호환용이며 자연 음성 엔진에는 전달하지 않음
       }))
-      .mutation(async ({ input, ctx }) => {
-        const { generateTTS } = await import('./_core/edgeTTS');
-        const { generateSupertonic2TTS, isSupertonic2Configured } = await import('./_core/supertonicTTS');
-        const { TRPCError } = await import('@trpc/server');
-        
-        try {
-          // 1. Supertonic2가 설정되어 있으면 우선 시도
-          if (isSupertonic2Configured()) {
-            try {
-              const result = await generateSupertonic2TTS({
-                text: input.text,
-                voiceType: input.voiceType,
-                speed: input.rate ? parseFloat(input.rate.replace('%', '')) / 100 + 1 : 1.05,
-              });
-              return { audioUrl: result.audioUrl, provider: result.provider };
-            } catch (stError) {
-              console.warn('[TTS] Supertonic2 실패, Edge TTS로 폴백:', stError);
-            }
-          }
+      .mutation(async ({ input }) => {
+        const { generateSupertonic2TTS, isSupertonic2Configured } = await import("./_core/supertonicTTS");
 
-          // 2. Supertonic2가 없거나 실패하면 Edge TTS 사용
-          const audioUrl = await generateTTS({
+        if (!isSupertonic2Configured()) {
+          throw new TRPCError({
+            code: "PRECONDITION_FAILED",
+            message: "자연 음성 서버가 준비되지 않았습니다. 화면의 질문으로 진행해주세요.",
+          });
+        }
+
+        try {
+          const parsedRate = input.rate
+            ? Number.parseFloat(input.rate.replace("%", "")) / 100 + 1
+            : 0.98;
+          const result = await generateSupertonic2TTS({
             text: input.text,
             voiceType: input.voiceType,
-            rate: input.rate,
-            pitch: input.pitch,
+            speed: Number.isFinite(parsedRate) ? parsedRate : 0.98,
           });
-          
-          return { audioUrl, provider: 'edge-tts' };
-        } catch (error: any) {
-          console.error('[TTS] 음성 생성 실패:', error);
-          console.error('[TTS] 오류 상세:', {
-            message: error.message,
-            stack: error.stack,
-            voiceType: input.voiceType,
-            textLength: input.text.length,
-          });
+          return { audioUrl: result.audioUrl, provider: result.provider };
+        } catch (error) {
+          const errorCode = error instanceof Error ? error.message : "TTS_UNAVAILABLE";
+          console.error("[TTS] NATURAL_VOICE_UNAVAILABLE", { errorCode });
           throw new TRPCError({
-            code: 'INTERNAL_SERVER_ERROR',
-            message: `TTS 생성 실패: ${error.message || '알 수 없는 오류'}`,
+            code: "INTERNAL_SERVER_ERROR",
+            message: "자연 음성을 준비하지 못했습니다. 화면의 질문으로 진행해주세요.",
           });
         }
       }),
