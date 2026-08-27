@@ -72,3 +72,80 @@ export function analyzeTranscript(text: string): TranscriptAnalysis {
     totalFlaggedCount: fillerCount + repeatedWordCount,
   };
 }
+
+
+/**
+ * Removes only pathological immediate loops (three or more identical words or
+ * phrases). A normal double repetition is preserved for honest coaching.
+ */
+export function cleanRecognizedTranscript(text: string): string {
+  const normalized = text.trim().replace(/\s+/g, " ");
+  if (!normalized) return "";
+
+  const tokens = normalized.split(" ");
+  const wordCollapsed: string[] = [];
+  for (let index = 0; index < tokens.length;) {
+    let end = index + 1;
+    while (end < tokens.length && tokens[end] === tokens[index]) end += 1;
+    const count = end - index;
+    const keep = count >= 3 ? 1 : count;
+    for (let repeat = 0; repeat < keep; repeat += 1) wordCollapsed.push(tokens[index]);
+    index = end;
+  }
+
+  const output: string[] = [];
+  for (const token of wordCollapsed) {
+    output.push(token);
+    let collapsed = true;
+    while (collapsed) {
+      collapsed = false;
+      const maxSize = Math.min(8, Math.floor(output.length / 3));
+      for (let size = maxSize; size >= 2; size -= 1) {
+        const first = output.slice(output.length - size * 3, output.length - size * 2).join(" ");
+        const second = output.slice(output.length - size * 2, output.length - size).join(" ");
+        const third = output.slice(output.length - size).join(" ");
+        if (first && first === second && second === third) {
+          output.splice(output.length - size * 2, size * 2);
+          collapsed = true;
+          break;
+        }
+      }
+    }
+  }
+  return output.join(" ");
+}
+
+/**
+ * Android Web Speech often returns a longer cumulative hypothesis instead of a
+ * new sentence. Replace the overlapping snapshot rather than appending it.
+ */
+export function mergeRecognizedSpeech(previous: string, next: string): string {
+  const left = cleanRecognizedTranscript(previous);
+  const right = cleanRecognizedTranscript(next);
+  if (!left) return right;
+  if (!right) return left;
+  if (left === right) return left;
+
+  const leftTokens = left.split(" ");
+  const rightTokens = right.split(" ");
+  const startsWith = (whole: string[], prefix: string[]) =>
+    prefix.length <= whole.length && prefix.every((token, index) => whole[index] === token);
+
+  if (startsWith(rightTokens, leftTokens)) return right;
+  if (startsWith(leftTokens, rightTokens)) return left;
+
+  const maximumOverlap = Math.min(leftTokens.length, rightTokens.length);
+  for (let overlap = maximumOverlap; overlap >= 1; overlap -= 1) {
+    const same = leftTokens
+      .slice(leftTokens.length - overlap)
+      .every((token, index) => token === rightTokens[index]);
+    const safeSingleTokenOverlap = overlap === 1 && leftTokens.length === 1;
+    if (same && (overlap >= 2 || safeSingleTokenOverlap)) {
+      return cleanRecognizedTranscript(
+        [...leftTokens, ...rightTokens.slice(overlap)].join(" "),
+      );
+    }
+  }
+
+  return cleanRecognizedTranscript(`${left} ${right}`);
+}
