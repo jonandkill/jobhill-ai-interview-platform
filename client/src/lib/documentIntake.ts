@@ -72,7 +72,6 @@ async function extractPdf(file: File): Promise<ExtractedDocument> {
     pdfjs.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
     const loadingTask = pdfjs.getDocument({
       data: bytes,
-      isEvalSupported: false,
       useWorkerFetch: false,
       stopAtErrors: true,
     });
@@ -103,7 +102,7 @@ async function extractPdf(file: File): Promise<ExtractedDocument> {
         needsReview: sparsePages > 0,
       };
     } finally {
-      await document.destroy();
+      await loadingTask.destroy();
     }
   } catch (error) {
     if (error instanceof DocumentIntakeError) throw error;
