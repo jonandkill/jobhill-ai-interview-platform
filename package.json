@@ -14,7 +14,7 @@
     "check": "tsc --noEmit",
     "format": "prettier --write .",
     "test": "vitest run",
-    "test:ci": "vitest run client/src/lib/mediaDeviceLifecycle.test.ts client/src/lib/interviewAudioCapture.test.ts client/src/lib/interviewWizard.test.ts client/src/lib/interviewWizardFlow.test.ts client/src/lib/safeHtml.test.ts client/src/lib/transcriptAnalysis.test.ts shared/interviewContext.test.ts shared/gameAssessments.test.ts shared/interviewFollowUps.test.ts shared/interviewFramework.test.ts shared/products.test.ts server/auth.logout.test.ts server/realInterview.test.ts server/receipt.test.ts server/tossPayment.test.ts server/ttsHttp.test.ts server/qwenTTS.test.ts server/supertonicTTS.test.ts",
+    "test:ci": "vitest run client/src/lib/documentIntake.test.ts client/src/lib/mediaDeviceLifecycle.test.ts client/src/lib/interviewAudioCapture.test.ts client/src/lib/interviewWizard.test.ts client/src/lib/interviewWizardFlow.test.ts client/src/lib/safeHtml.test.ts client/src/lib/transcriptAnalysis.test.ts shared/interviewContext.test.ts shared/gameAssessments.test.ts shared/interviewFollowUps.test.ts shared/interviewFramework.test.ts shared/products.test.ts server/auth.logout.test.ts server/realInterview.test.ts server/receipt.test.ts server/tossPayment.test.ts server/ttsHttp.test.ts server/qwenTTS.test.ts server/supertonicTTS.test.ts",
     "db:push": "drizzle-kit generate && drizzle-kit migrate"
   },
   "dependencies": {
@@ -94,7 +94,8 @@
     "tailwindcss-animate": "^1.0.7",
     "vaul": "^1.1.2",
     "wouter": "^3.3.5",
-    "zod": "^4.1.12"
+    "zod": "^4.1.12",
+    "pdfjs-dist": "6.2.108"
   },
   "devDependencies": {
     "@builder.io/vite-plugin-jsx-loc": "^0.1.1",

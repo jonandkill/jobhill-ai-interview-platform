@@ -1,5 +1,6 @@
 import { useAuth } from "@/_core/hooks/useAuth";
 import DashboardLayout from "@/components/DashboardLayout";
+import DocumentIntakePanel from "@/components/DocumentIntakePanel";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -353,6 +354,28 @@ export default function Profile() {
         </div>
 
         <form onSubmit={handleSubmit} className="space-y-6">
+          <DocumentIntakePanel
+            onResumeApply={(text) => {
+              setFormData((previous) => ({
+                ...previous,
+                experience: previous.experience.trim()
+                  ? `${previous.experience.trim()}\n\n${text}`
+                  : text,
+              }));
+              toast.success("인식한 이력서 내용을 경력·경험 항목에 반영했습니다.");
+            }}
+            onCoverLetterApply={(text) => {
+              setCoverLetterItems((previous) => [
+                ...previous,
+                {
+                  id: `pdf-${Date.now()}`,
+                  title: "PDF에서 가져온 자기소개서",
+                  content: text,
+                },
+              ]);
+              toast.success("인식한 자기소개서를 새 항목으로 반영했습니다.");
+            }}
+          />
           {/* 지원 정보 */}
           <Card>
             <CardHeader>
