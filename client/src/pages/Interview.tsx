@@ -64,7 +64,7 @@ import {
   EmotionType,
   getEmotionByScore
 } from "@/components/InterviewerAvatar";
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback, useRef, type ChangeEvent } from "react";
 import { createPortal } from "react-dom";
 import { RadarChart, PolarGrid, PolarAngleAxis, PolarRadiusAxis, Radar, ResponsiveContainer, Tooltip } from "recharts";
 import {
@@ -1161,20 +1161,20 @@ export default function Interview() {
     setTtsProviderStatus('loading');
     setIsSpeaking(true);
     
-    // Edge TTS 시도
+    // 사설 자연 음성 생성 시도
     try {
       // 아바타별 voiceStyle 반영
       const avatarVoiceStyle = selectedAvatar.voiceStyle;
       
       // 속도 계산: 아바타 설정 * 사용자 설정 배율
       const rate = avatarVoiceStyle.rate * ttsSpeed;
-      // Edge TTS rate 형식으로 변환 (0.5 ~ 2.0 → -50% ~ +100%)
+      // 자연 음성 속도 형식으로 변환 (0.5 ~ 2.0 → -50% ~ +100%)
       const ratePercent = Math.round((rate - 1.0) * 100);
       const rateStr = ratePercent >= 0 ? `+${ratePercent}%` : `${ratePercent}%`;
       
       // 음높이 계산: 아바타 설정 반영
       const pitch = Math.max(0.5, Math.min(2.0, avatarVoiceStyle.pitch));
-      // Edge TTS pitch 형식으로 변환 (0.5 ~ 2.0 → -50Hz ~ +50Hz)
+      // 자연 음성 높이 형식으로 변환 (0.5 ~ 2.0 → -50Hz ~ +50Hz)
       const pitchHz = Math.round((pitch - 1.0) * 50);
       const pitchStr = pitchHz >= 0 ? `+${pitchHz}Hz` : `${pitchHz}Hz`;
       
@@ -1203,7 +1203,7 @@ export default function Interview() {
       setCurrentAudio(audio);
       
       audio.onended = async () => {
-        console.log('[TTS] Edge TTS 음성 재생 완료');
+        console.log('[TTS] 자연 음성 재생 완료');
         setIsSpeaking(false);
         
         // AI 음성 완료 후 타이머 시작
@@ -1327,11 +1327,11 @@ export default function Interview() {
   useEffect(() => {
     const handleBeforeUnload = (e: BeforeUnloadEvent) => {
       if (status !== 'idle' && status !== 'completed') {
-        // TTS 중지
-        if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
-          window.speechSynthesis.cancel();
+        listeningRequestedRef.current = false;
+        if (recognitionRestartTimerRef.current) {
+          window.clearTimeout(recognitionRestartTimerRef.current);
+          recognitionRestartTimerRef.current = null;
         }
-        // 음성 인식 중지
         if (speechRecognition) {
           speechRecognition.stop();
         }
@@ -1345,9 +1345,11 @@ export default function Interview() {
     window.addEventListener('beforeunload', handleBeforeUnload);
     return () => {
       window.removeEventListener('beforeunload', handleBeforeUnload);
-      // 컴포넌트 언마운트 시 TTS 및 음성 인식 정리
-      if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
-        window.speechSynthesis.cancel();
+      // 컴포넌트 언마운트 시 마이크 생애주기를 완전히 정리합니다.
+      listeningRequestedRef.current = false;
+      if (recognitionRestartTimerRef.current) {
+        window.clearTimeout(recognitionRestartTimerRef.current);
+        recognitionRestartTimerRef.current = null;
       }
       if (speechRecognition) {
         speechRecognition.stop();
