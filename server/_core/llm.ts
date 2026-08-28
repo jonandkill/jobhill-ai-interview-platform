@@ -1,3 +1,4 @@
+import { compactKnowledgeContext } from "@shared/interviewKnowledge";
 import { ENV } from "./env";
 
 export type Role = "system" | "user" | "assistant" | "tool" | "function";
@@ -209,15 +210,69 @@ const normalizeToolChoice = (
   return toolChoice;
 };
 
-const resolveApiUrl = () =>
-  ENV.forgeApiUrl && ENV.forgeApiUrl.trim().length > 0
-    ? `${ENV.forgeApiUrl.replace(/\/$/, "")}/v1/chat/completions`
-    : "https://forge.manus.im/v1/chat/completions";
+type ApiConfig = {
+  url: string;
+  apiKey: string;
+  model: string;
+  provider: "openai" | "forge";
+};
 
-const assertApiKey = () => {
-  if (!ENV.forgeApiKey) {
-    throw new Error("OPENAI_API_KEY is not configured");
+const hasFileContent = (messages: Message[]) =>
+  messages.some(message =>
+    ensureArray(message.content).some(part => typeof part !== "string" && part.type === "file_url"),
+  );
+
+const resolveApiConfig = (messages: Message[]): ApiConfig => {
+  if (ENV.openaiApiKey && !hasFileContent(messages)) {
+    if (!ENV.openaiModel) {
+      throw new Error("OPENAI_MODEL is not configured");
+    }
+    return {
+      url: "https://api.openai.com/v1/chat/completions",
+      apiKey: ENV.openaiApiKey,
+      model: ENV.openaiModel,
+      provider: "openai",
+    };
   }
+
+  if (!ENV.forgeApiKey) {
+    if (hasFileContent(messages) && ENV.openaiApiKey) {
+      throw new Error("file_url content requires the managed AI provider");
+    }
+    throw new Error("AI API key is not configured");
+  }
+  return {
+    url: ENV.forgeApiUrl && ENV.forgeApiUrl.trim().length > 0
+      ? `${ENV.forgeApiUrl.replace(/\/$/, "")}/v1/chat/completions`
+      : "https://forge.manus.im/v1/chat/completions",
+    apiKey: ENV.forgeApiKey,
+    model: "gemini-2.5-flash",
+    provider: "forge",
+  };
+};
+
+const messageText = (message: Message) =>
+  ensureArray(message.content)
+    .map(part => typeof part === "string" ? part : part.type === "text" ? part.text : "")
+    .filter(Boolean)
+    .join("\n");
+
+const enrichInterviewMessages = (messages: Message[]) => {
+  const prompt = messages.map(messageText).join("\n");
+  const question = prompt.match(/면접 질문:\s*([^\n]+)/)?.[1]?.trim();
+  if (!question) return messages;
+
+  const knowledgeMessage: Message = {
+    role: "system",
+    content: compactKnowledgeContext(question),
+  };
+  const firstUserIndex = messages.findIndex(message => message.role === "user");
+  if (firstUserIndex < 0) return [...messages, knowledgeMessage];
+  return [
+    ...messages.slice(0, firstUserIndex),
+    knowledgeMessage,
+    ...messages.slice(firstUserIndex),
+  ];
 };
 
 const normalizeResponseFormat = ({
@@ -266,8 +321,6 @@ const normalizeResponseFormat = ({
 };
 
 export async function invokeLLM(params: InvokeParams): Promise<InvokeResult> {
-  assertApiKey();
-
   const {
     messages,
     tools,
@@ -279,9 +332,10 @@ export async function invokeLLM(params: InvokeParams): Promise<InvokeResult> {
     response_format,
   } = params;
 
+  const apiConfig = resolveApiConfig(messages);
   const payload: Record<string, unknown> = {
-    model: "gemini-2.5-flash",
-    messages: messages.map(normalizeMessage),
+    model: apiConfig.model,
+    messages: enrichInterviewMessages(messages).map(normalizeMessage),
   };
 
   if (tools && tools.length > 0) {
@@ -296,9 +350,14 @@ export async function invokeLLM(params: InvokeParams): Promise<InvokeResult> {
     payload.tool_choice = normalizedToolChoice;
   }
 
-  payload.max_tokens = 32768
-  payload.thinking = {
-    "budget_tokens": 128
+  const requestedMaxTokens = params.maxTokens ?? params.max_tokens ?? 2_400;
+  const maxTokens = Math.max(256, Math.min(2_400, Math.floor(requestedMaxTokens)));
+  if (apiConfig.provider === "openai") {
+    payload.max_completion_tokens = maxTokens;
+    payload.store = false;
+  } else {
+    payload.max_tokens = maxTokens;
+    payload.thinking = { budget_tokens: Math.min(128, maxTokens) };
   }
 
   const normalizedResponseFormat = normalizeResponseFormat({
@@ -312,20 +371,27 @@ export async function invokeLLM(params: InvokeParams): Promise<InvokeResult> {
     payload.response_format = normalizedResponseFormat;
   }
 
-  const response = await fetch(resolveApiUrl(), {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      authorization: `Bearer ${ENV.forgeApiKey}`,
-    },
-    body: JSON.stringify(payload),
-  });
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 30_000);
+  let response: Response;
+  try {
+    response = await fetch(apiConfig.url, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${apiConfig.apiKey}`,
+      },
+      body: JSON.stringify(payload),
+      redirect: "error",
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timeout);
+  }
 
   if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(
-      `LLM invoke failed: ${response.status} ${response.statusText} – ${errorText}`
-    );
+    if (response.body) await response.body.cancel().catch(() => undefined);
+    throw new Error(`LLM invoke failed with status ${response.status}`);
   }
 
   return (await response.json()) as InvokeResult;

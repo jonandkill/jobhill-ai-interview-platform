@@ -8,6 +8,14 @@ import {
   summarizeRubricCheckpoint,
   type InterviewRubricScores,
 } from "./interviewFramework";
+import {
+  EXPERIENCE_ACTION_LADDER,
+  INTERVIEW_QUESTION_KNOWLEDGE,
+  STRESS_SITUATIONS,
+  buildExperienceFrame,
+  compactKnowledgeContext,
+  searchInterviewKnowledge,
+} from "./interviewKnowledge";
 
 describe("interview framework", () => {
   it("keeps a three-question interview in basic, document, fit order", () => {
@@ -78,6 +86,61 @@ describe("interview framework", () => {
       { rubricScores: null },
       { rubricScores: { relevance: 10, evidence: 10, structure: 10, roleFit: 10, clarity: 10 } },
     ]).insufficientData).toBe(true);
+  });
+
+  it("keeps the verified 30-question taxonomy without duplicate ids", () => {
+    const counts = INTERVIEW_QUESTION_KNOWLEDGE.reduce<Record<string, number>>((result, knowledge) => {
+      result[knowledge.category] = (result[knowledge.category] || 0) + 1;
+      return result;
+    }, {});
+    expect(INTERVIEW_QUESTION_KNOWLEDGE).toHaveLength(30);
+    expect(new Set(INTERVIEW_QUESTION_KNOWLEDGE.map(knowledge => knowledge.id)).size).toBe(30);
+    expect(counts).toEqual({ basic: 8, frequent: 7, role: 5, experience: 4, pressure: 6 });
+  });
+
+  it("retrieves only a small relevant local knowledge set", () => {
+    const matches = searchInterviewKnowledge("졸업 후 공백 기간에는 무엇을 준비했나요?", 2);
+    expect(matches.length).toBeGreaterThan(0);
+    expect(matches.length).toBeLessThanOrEqual(2);
+    expect(matches[0].id).toBe("pressure-gap");
+    expect(compactKnowledgeContext("프로젝트 경험을 말해 주세요")).toContain("프로젝트");
+    expect(searchInterviewKnowledge("   ")).toEqual([]);
+  });
+
+  it("keeps eight stress situations and ten preparation-action-feedback rows", () => {
+    expect(STRESS_SITUATIONS).toHaveLength(8);
+    expect(EXPERIENCE_ACTION_LADDER).toHaveLength(10);
+    expect(EXPERIENCE_ACTION_LADDER[0]).toMatchObject({
+      preparation: "물어보기",
+      execution: "따라하기",
+      feedback: "피드백 반영하기",
+    });
+  });
+
+  it("returns only original substrings in the five-phase experience map", () => {
+    const answer = [
+      "시간이 촉박해 담당자에게 방법을 문의했습니다.",
+      "업무 기준을 문서화해 직접 시도했습니다.",
+      "피드백을 반영해 다시 수정하고 팀에 공유했습니다.",
+      "그 결과 오류가 20% 감소해 팀 일정에 기여했습니다.",
+      "배운 기준을 이후 다른 업무에도 적용했습니다.",
+    ].join(" ");
+    const frame = buildExperienceFrame({ question: "가장 힘들었던 경험", answer });
+    expect(frame.phases).toHaveLength(5);
+    expect(frame.evidenceCount).toBe(5);
+    for (const phase of frame.phases) {
+      if (phase.evidence) expect(answer).toContain(phase.evidence);
+    }
+    expect(frame.stressSituations.map(situation => situation.id)).toContain("time-pressure");
+  });
+
+  it("does not turn an abstract persistence claim into experience evidence", () => {
+    const frame = buildExperienceFrame({
+      question: "가장 힘들었던 경험을 말해 주세요.",
+      answer: "저는 끈기가 강한 사람입니다.",
+    });
+    expect(frame.applicable).toBe(true);
+    expect(frame.evidenceCount).toBe(0);
   });
 });
 

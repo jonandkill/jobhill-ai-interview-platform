@@ -7,6 +7,8 @@ export const ENV = {
   appBaseUrl: process.env.APP_BASE_URL ?? "",
   ownerOpenId: process.env.OWNER_OPEN_ID ?? "",
   isProduction: process.env.NODE_ENV === "production",
+  openaiApiKey: process.env.OPENAI_API_KEY?.trim() ?? "",
+  openaiModel: process.env.OPENAI_MODEL?.trim() ?? "",
   forgeApiUrl: process.env.BUILT_IN_FORGE_API_URL ?? "",
   forgeApiKey: process.env.BUILT_IN_FORGE_API_KEY ?? "",
   stripeSecretKey: process.env.STRIPE_SECRET_KEY ?? "",

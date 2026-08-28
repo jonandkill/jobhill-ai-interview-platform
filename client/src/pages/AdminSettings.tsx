@@ -10,7 +10,14 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Slider } from "@/components/ui/slider";
 import { toast } from "sonner";
 import { trpc } from "@/lib/trpc";
-import { Loader2, Save, Settings, MessageSquare, Star, Gift, Bell } from "lucide-react";
+import { Home, KeyRound, Loader2, Save, Settings, MessageSquare, Star, Gift, Bell } from "lucide-react";
+
+interface AiConnectionResult {
+  ok: boolean;
+  configured: boolean;
+  code: string;
+  message: string;
+}
 
 // 후기 요청 설정 타입
 interface ReviewRequestSettings {
@@ -42,9 +49,13 @@ const defaultReviewSettings: ReviewRequestSettings = {
 export default function AdminSettings() {
   const [reviewSettings, setReviewSettings] = useState<ReviewRequestSettings>(defaultReviewSettings);
   const [isSaving, setIsSaving] = useState(false);
+  const [ephemeralApiKey, setEphemeralApiKey] = useState("");
+  const [aiConnectionResult, setAiConnectionResult] = useState<AiConnectionResult | null>(null);
 
   const settingsQuery = trpc.admin.settings.list.useQuery();
   const upsertMutation = trpc.admin.settings.upsert.useMutation();
+  const openAiStatusQuery = trpc.system.openAiStatus.useQuery();
+  const aiConnectionMutation = trpc.system.testOpenAiApiKey.useMutation({ gcTime: 0 });
 
   // 설정 로드
   useEffect(() => {
@@ -78,6 +89,36 @@ export default function AdminSettings() {
     }
   };
 
+  const handleAiConnectionTest = async (mode: "configured" | "ephemeral") => {
+    if (mode === "ephemeral" && ephemeralApiKey.length < 20) {
+      toast.error("검사할 OpenAI API 키를 입력해주세요.");
+      return;
+    }
+    setAiConnectionResult(null);
+    try {
+      const result = await aiConnectionMutation.mutateAsync(
+        mode === "configured"
+          ? { mode: "configured" }
+          : { mode: "ephemeral", apiKey: ephemeralApiKey },
+      );
+      setAiConnectionResult(result);
+      if (result.ok) toast.success(result.message);
+      else toast.error(result.message);
+      if (mode === "configured") openAiStatusQuery.refetch();
+    } catch {
+      setAiConnectionResult({
+        ok: false,
+        configured: false,
+        code: "request_failed",
+        message: "연결 검사를 완료하지 못했습니다.",
+      });
+      toast.error("연결 검사를 완료하지 못했습니다.");
+    } finally {
+      setEphemeralApiKey("");
+      aiConnectionMutation.reset();
+    }
+  };
+
   if (settingsQuery.isLoading) {
     return (
       <DashboardLayout>
@@ -91,15 +132,108 @@ export default function AdminSettings() {
   return (
     <DashboardLayout>
       <div className="max-w-4xl mx-auto space-y-6 px-4">
-        <div className="flex items-center gap-3">
-          <div className="w-12 h-12 rounded-lg bg-primary/10 flex items-center justify-center">
-            <Settings className="w-6 h-6 text-primary" />
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-center gap-3">
+            <div className="w-12 h-12 rounded-lg bg-primary/10 flex items-center justify-center">
+              <Settings className="w-6 h-6 text-primary" />
+            </div>
+            <div>
+              <h1 className="text-2xl font-bold">시스템 설정</h1>
+              <p className="text-muted-foreground">서비스 운영에 필요한 설정을 관리합니다.</p>
+            </div>
           </div>
-          <div>
-            <h1 className="text-2xl font-bold">시스템 설정</h1>
-            <p className="text-muted-foreground">서비스 운영에 필요한 설정을 관리합니다.</p>
-          </div>
+          <Button variant="outline" asChild>
+            <a href="/" aria-label="홈으로 돌아가기">
+              <Home className="mr-2 h-4 w-4" />
+              홈으로 돌아가기
+            </a>
+          </Button>
         </div>
+
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <KeyRound className="h-5 w-5 text-primary" />
+              OpenAI 첨삭 연결 점검
+            </CardTitle>
+            <CardDescription>
+              운영 Secret 연결을 확인하거나 새 키를 저장하지 않고 한 번만 검사합니다.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div className="grid gap-2 sm:grid-cols-3">
+              <div className="rounded-lg border p-3">
+                <p className="text-xs text-muted-foreground">운영 Secret</p>
+                <p className="mt-1 text-sm font-semibold">
+                  {openAiStatusQuery.data?.configured ? "등록됨" : "미등록"}
+                </p>
+              </div>
+              <div className="rounded-lg border p-3">
+                <p className="text-xs text-muted-foreground">OpenAI 모델명</p>
+                <p className="mt-1 text-sm font-semibold">
+                  {openAiStatusQuery.data?.modelConfigured ? "등록됨" : "미등록"}
+                </p>
+              </div>
+              <div className="rounded-lg border p-3">
+                <p className="text-xs text-muted-foreground">기존 공급자 폴백</p>
+                <p className="mt-1 text-sm font-semibold">
+                  {openAiStatusQuery.data?.forgeFallbackConfigured ? "사용 가능" : "미등록"}
+                </p>
+              </div>
+            </div>
+            <Button
+              type="button"
+              variant="outline"
+              disabled={aiConnectionMutation.isPending}
+              onClick={() => handleAiConnectionTest("configured")}
+            >
+              {aiConnectionMutation.isPending && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+              등록된 Secret 검사
+            </Button>
+            <div className="space-y-2">
+              <Label htmlFor="ephemeral-openai-key">OpenAI API 키 일회성 검사</Label>
+              <div className="flex flex-col gap-2 sm:flex-row">
+                <Input
+                  id="ephemeral-openai-key"
+                  name="ephemeral-openai-key"
+                  type="password"
+                  value={ephemeralApiKey}
+                  onChange={event => setEphemeralApiKey(event.target.value)}
+                  maxLength={512}
+                  autoComplete="new-password"
+                  spellCheck={false}
+                  placeholder="키는 검사 후 즉시 입력란에서 삭제됩니다"
+                />
+                <Button
+                  type="button"
+                  disabled={aiConnectionMutation.isPending || ephemeralApiKey.length < 20}
+                  onClick={() => handleAiConnectionTest("ephemeral")}
+                >
+                  저장하지 않고 키 검사
+                </Button>
+              </div>
+              <p className="text-xs leading-5 text-muted-foreground">
+                이 입력란은 키를 저장하지 않습니다. 실제 운영에는 배포 Secret 저장소에
+                OPENAI_API_KEY와 OPENAI_MODEL을 등록해야 합니다.
+              </p>
+            </div>
+            {aiConnectionResult && (
+              <div
+                role="status"
+                className={aiConnectionResult.ok
+                  ? "rounded-lg border border-emerald-500/30 bg-emerald-500/5 p-3 text-sm"
+                  : "rounded-lg border border-amber-500/30 bg-amber-500/5 p-3 text-sm"}
+              >
+                <p className="font-medium">{aiConnectionResult.message}</p>
+                {!aiConnectionResult.configured && aiConnectionResult.ok && (
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    검사한 키는 운영 설정에 저장되지 않았습니다.
+                  </p>
+                )}
+              </div>
+            )}
+          </CardContent>
+        </Card>
 
         {/* 후기 요청 설정 */}
         <Card>
