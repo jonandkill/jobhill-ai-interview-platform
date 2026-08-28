@@ -201,10 +201,11 @@ export function buildExperienceFrame(input: {
   const topCategory = knowledgeMatches[0]?.category;
   const applicable = ["role", "experience", "pressure"].includes(topCategory ?? "")
     || /경험|사례|경력|인턴|프로젝트|어려|힘들|스트레스|강점|기여|문제|피드백|업무/.test(input.question);
-  const stressSituations = STRESS_SITUATIONS.map(stress => {
+  const stressSituations = STRESS_SITUATIONS.reduce<ExperienceEvidenceItem[]>((items, stress) => {
     const evidence = evidenceSentence(input.answer, stress.pattern);
-    return evidence ? { id: stress.id, label: stress.label, evidence } : null;
-  }).filter((value): value is ExperienceEvidenceItem => value !== null);
+    if (evidence) items.push({ id: stress.id, label: stress.label, evidence });
+    return items;
+  }, []);
   const phases = [
     phase("preparation", "준비", input.answer, ACTION_PATTERNS.preparation, "누구에게 물었고 무엇을 찾아 기준을 확인했는지 실제 장면을 말하세요."),
     phase("execution", "실행", input.answer, ACTION_PATTERNS.execution, "따라 하기에서 시작해 직접 시도·체크·비교·문서화한 행동을 말하세요."),
