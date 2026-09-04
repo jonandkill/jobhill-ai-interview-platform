@@ -1,0 +1,35 @@
+services:
+  qwen3-tts:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:7790:8000"
+    environment:
+      QWEN_MODEL_PATH: /models/Qwen3-TTS-12Hz-1.7B-CustomVoice
+      QWEN_MODEL_REVISION: b611c9f8f2ad5c741ed9c7a0a6a3750e43e0dfd7
+      QWEN_DEVICE: cuda:0
+      QWEN_ATTENTION: sdpa
+      TTS_SERVICE_TOKEN_FILE: /run/secrets/tts_service_token
+      TTS_MAX_CONCURRENCY: "1"
+    volumes:
+      - ./models:/models:ro
+    secrets:
+      - tts_service_token
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,noexec,nosuid,nodev
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+secrets:
+  tts_service_token:
+    file: ./secrets/tts_service_token

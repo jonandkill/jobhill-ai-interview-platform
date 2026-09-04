@@ -1,0 +1,1 @@
+ALTER TABLE `interview_sessions` ADD `isFavorite` boolean DEFAULT false;

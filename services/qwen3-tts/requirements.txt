@@ -1,0 +1,4 @@
+fastapi==0.116.1
+uvicorn[standard]==0.35.0
+soundfile==0.13.1
+qwen-tts @ git+https://github.com/QwenLM/Qwen3-TTS.git@022e286b98fbec7e1e916cb940cdf532cd9f488e
