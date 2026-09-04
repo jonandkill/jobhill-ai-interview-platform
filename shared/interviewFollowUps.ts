@@ -1,5 +1,6 @@
 export interface FollowUpAttemptLike {
   sessionId?: number | null;
+  originalQuestion?: string | null;
   followUpQuestion: string;
   followUpAnswer?: string | null;
   followUpScore?: number | null;
@@ -17,6 +18,7 @@ export function getAnsweredUniqueFollowUps<T extends FollowUpAttemptLike>(rows: 
     ) continue;
     const key = [
       row.sessionId ?? "none",
+      row.originalQuestion?.trim().replace(/\s+/g, " ") ?? "none",
       row.depth ?? 1,
       row.followUpQuestion.trim().replace(/\s+/g, " "),
     ].join(":");

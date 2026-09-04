@@ -49,7 +49,7 @@ const menuGroups = [
     icon: Brain,
     items: [
       { icon: Brain, label: "모의 면접 시작", path: "/interview" },
-      { icon: Zap, label: "화상 모의면접", path: "/interview" },
+      { icon: Zap, label: "화상 모의면접", path: "/real-interview" },
       { icon: Sparkles, label: "AI 실시간 평가", path: "/ai-evaluation" },
       { icon: Gamepad2, label: "게임형 평가", path: "/game-assessment" },
     ]
@@ -124,8 +124,10 @@ const MAX_WIDTH = 480;
 
 export default function DashboardLayout({
   children,
+  immersive = false,
 }: {
   children: React.ReactNode;
+  immersive?: boolean;
 }) {
   const [sidebarWidth, setSidebarWidth] = useState(() => {
     const saved = localStorage.getItem(SIDEBAR_WIDTH_KEY);
@@ -165,6 +167,10 @@ export default function DashboardLayout({
         </div>
       </div>
     );
+  }
+
+  if (immersive) {
+    return <main className="min-h-dvh bg-slate-950 text-slate-50">{children}</main>;
   }
 
   return (

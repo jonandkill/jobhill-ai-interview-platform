@@ -104,7 +104,7 @@ Supertonic2 자체에는 문자당 API 비용이 없다. 따라서 비용은 **C
 - `server/_core/supertonicTTS.ts`: 공식 `/v1/tts` HTTP 계약을 호출하고 WAV를 S3에 저장하는 어댑터, 짧은 TTL 메모리 캐시, timeout, 음성 매핑을 제공한다.
 - `server/routers.ts`: `SUPERTONIC2_TTS_URL`이 있으면 Supertonic2를 우선 사용하고, 실패하면 기존 Edge TTS를 사용한다.
 - `server/_core/edgeTTS.ts`: 질문 텍스트를 Python 코드에 직접 삽입하지 않고 argv로 전달하여 따옴표·개행이 포함된 문장의 실패 가능성을 줄였다.
-- `client/src/pages/RealInterview.tsx`: 자동재생 실패 시 화면을 유지하고, 질문 다시 듣기·음성 재시도·답변 시작·설정으로 돌아가기·답변 제출 후 다음 질문 버튼을 제공한다.
+- `client/src/pages/Interview.tsx`: 통합 화상 면접 화면을 유지하면서 질문 다시 듣기·음성 재시도·답변 시작·설정으로 돌아가기·답변 제출 후 다음 질문 버튼을 제공한다.
 
 ## 아직 운영 전환하지 않은 항목
 

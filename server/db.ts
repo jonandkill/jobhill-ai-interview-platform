@@ -1,4 +1,4 @@
-import { eq, and, desc, or, lte, gte, inArray, sql, like, count } from "drizzle-orm";
+import { eq, and, desc, or, lte, gte, inArray, isNull, sql, like, count } from "drizzle-orm";
 import {
   GAME_ASSESSMENT_BY_ID,
   getStoredAssessmentId,
@@ -2168,13 +2168,20 @@ export async function toggleFollowUpBookmark(id: number, userId: number, isBookm
 
 export async function updateFollowUpAnswer(id: number, userId: number, data: {
   followUpAnswer?: string;
+  followUpFeedback?: string;
+  followUpScore?: number;
 }) {
   const db = await getDb();
   if (!db) throw new Error("Database not available");
   
-  await db.update(followUpHistory)
+  const result = await db.update(followUpHistory)
     .set(data)
-    .where(and(eq(followUpHistory.id, id), eq(followUpHistory.userId, userId)));
+    .where(and(
+      eq(followUpHistory.id, id),
+      eq(followUpHistory.userId, userId),
+      isNull(followUpHistory.followUpAnswer),
+    ));
+  return Number((result as any)?.[0]?.affectedRows || 0) === 1;
 }
 
 

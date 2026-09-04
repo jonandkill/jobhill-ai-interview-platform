@@ -10,6 +10,14 @@ export const INTERVIEW_SETUP_LABELS = [
 
 export type InterviewSetupStep = 0 | 1 | 2 | 3 | 4 | 5 | 6;
 
+export function getInterviewEntryDefaults(pathname: string) {
+  const videoInterview = pathname.replace(/\/+$/, "") === "/real-interview";
+  return {
+    voiceMode: videoInterview,
+    recordingMode: videoInterview ? "automatic" as const : "manual" as const,
+  };
+}
+
 export function moveInterviewSetupStep(current: InterviewSetupStep, direction: 1 | -1): InterviewSetupStep {
   const next = Math.max(0, Math.min(INTERVIEW_SETUP_LABELS.length - 1, current + direction));
   return next as InterviewSetupStep;

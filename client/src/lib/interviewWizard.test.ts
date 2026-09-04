@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   canContinueInterviewWizard,
+  getInterviewEntryDefaults,
   getQuestionRecoveryMessage,
   INTERVIEW_SETUP_LABELS,
   moveInterviewSetupStep,
@@ -26,5 +27,16 @@ describe("interview setup wizard", () => {
   it("provides different recovery instructions for timeout and error", () => {
     expect(getQuestionRecoveryMessage(true)).toContain("오래 걸리고");
     expect(getQuestionRecoveryMessage(false)).toContain("다시 시도");
+  });
+
+  it("opens the dedicated video route with voice and automatic recording", () => {
+    expect(getInterviewEntryDefaults("/real-interview")).toEqual({
+      voiceMode: true,
+      recordingMode: "automatic",
+    });
+    expect(getInterviewEntryDefaults("/interview")).toEqual({
+      voiceMode: false,
+      recordingMode: "manual",
+    });
   });
 });

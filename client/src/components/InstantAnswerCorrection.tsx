@@ -52,7 +52,7 @@ export default function InstantAnswerCorrection({
   return (
     <section
       className="rounded-xl border-2 border-primary/30 bg-primary/5 p-4 sm:p-5"
-      aria-labelledby="instant-correction-title"
+      aria-labelledby={correction ? "instant-correction-title" : undefined}
     >
       {correction && (
         <>

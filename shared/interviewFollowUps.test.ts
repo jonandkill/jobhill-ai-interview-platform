@@ -18,4 +18,13 @@ describe("answered follow-up selection", () => {
     ];
     expect(getAnsweredUniqueFollowUps(rows)).toEqual([rows[0]]);
   });
+
+  it("keeps identical probes when they belong to different parent questions", () => {
+    const rows = [
+      { sessionId: 1, originalQuestion: "본인의 역할은 무엇이었나요?", depth: 1, followUpQuestion: "그 근거는 무엇인가요?", followUpAnswer: "역할표를 확인했습니다.", followUpScore: 80 },
+      { sessionId: 1, originalQuestion: "성과를 말씀해 주세요.", depth: 1, followUpQuestion: "그 근거는 무엇인가요?", followUpAnswer: "검사 기록을 확인했습니다.", followUpScore: 75 },
+    ];
+
+    expect(getAnsweredUniqueFollowUps(rows)).toEqual(rows);
+  });
 });

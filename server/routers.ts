@@ -99,6 +99,31 @@ const revisionFeedbackSchema = z.object({
   remainingIssues: z.string().min(1).max(5000),
 });
 
+const questionTimingInfo = {
+  personality: { timing: "초반", mood: "분위기 파악 단계", answerStyle: "자연스럽고 여유롭게 답변" },
+  experience: { timing: "중반", mood: "분위기 좋을 때", answerStyle: "STAR 기법으로 구체적 사례 중심" },
+  technical: { timing: "중반", mood: "집중 평가 단계", answerStyle: "논리적이고 구조화된 답변" },
+  situational: { timing: "후반", mood: "분위기 안 나올 때 자주 나옴", answerStyle: "침착하고 단계적인 대응 강조" },
+  company: { timing: "초반/후반", mood: "관심도 확인 단계", answerStyle: "열정과 준비성 강조" },
+} as const;
+
+const questionGenerationFlights = new Map<string, Promise<unknown>>();
+
+async function runQuestionGenerationSingleFlight<T>(key: string, operation: () => Promise<T>): Promise<T> {
+  const active = questionGenerationFlights.get(key);
+  if (active) return active as Promise<T>;
+
+  const flight = operation();
+  questionGenerationFlights.set(key, flight);
+  try {
+    return await flight;
+  } finally {
+    if (questionGenerationFlights.get(key) === flight) {
+      questionGenerationFlights.delete(key);
+    }
+  }
+}
+
 const gameAttemptMetricsSchema = z.object({
   totalTrials: z.number().int().min(1).max(500),
   correct: z.number().int().min(0).max(500),
@@ -591,11 +616,16 @@ export const appRouter = router({  system: systemRouter,
           formality: z.enum(['formal', 'semi-formal', 'casual']),
           questionStyle: z.enum(['direct', 'indirect', 'probing', 'friendly']),
           feedbackStyle: z.enum(['strict', 'encouraging', 'balanced', 'detailed']),
-          promptStyle: z.string(),
+          promptStyle: z.string().trim().max(400),
         }).optional(),
       }))
       .mutation(async ({ ctx, input }) => {
+        const flightKey = `${ctx.user.id}:${input.sessionId}:${input.questionOrder}`;
+        return runQuestionGenerationSingleFlight(flightKey, async () => {
         const session = await requireOwnedInterviewSession(ctx.user.id, input.sessionId);
+        if (session.status !== "in_progress") {
+          throw new TRPCError({ code: "CONFLICT", message: "진행 중인 면접에서만 질문을 생성할 수 있습니다." });
+        }
         let selectedQuestions: string[] = [];
         if (session.selectedQuestions) {
           try {
@@ -621,6 +651,25 @@ export const appRouter = router({  system: systemRouter,
           throw new TRPCError({ code: "BAD_REQUEST", message: "질문 순서가 면접 계획 범위를 벗어났습니다." });
         }
         const currentPhase = getInterviewPhaseById(slot.phaseId);
+        const timingInfo = slot.source === "prepared"
+          ? { timing: "사전 질문 파트", mood: "필수 질문 확인", answerStyle: "질문의 조건에 직접 답변" }
+          : questionTimingInfo[currentPhase.questionType];
+        const existingQAs = await db.getSessionQAs(input.sessionId);
+        const existingQA = existingQAs.find(qa => qa.questionOrder === input.questionOrder);
+        if (existingQA) {
+          return {
+            ...existingQA,
+            phaseId: currentPhase.id,
+            phaseLabel: currentPhase.label,
+            timingInfo,
+          };
+        }
+        if (input.questionOrder > 0) {
+          const previousQA = existingQAs.find(qa => qa.questionOrder === input.questionOrder - 1);
+          if (!previousQA?.userAnswer?.trim()) {
+            throw new TRPCError({ code: "CONFLICT", message: "이전 질문에 답변한 뒤 다음 질문을 진행해주세요." });
+          }
+        }
 
         if (slot.source === "prepared") {
           const selectedQuestion = selectedQuestions[slot.preparedQuestionIndex ?? -1];
@@ -637,7 +686,7 @@ export const appRouter = router({  system: systemRouter,
             ...qa,
             phaseId: currentPhase.id,
             phaseLabel: currentPhase.label,
-            timingInfo: { timing: "사전 질문 파트", mood: "필수 질문 확인", answerStyle: "질문의 조건에 직접 답변" },
+            timingInfo,
           };
         }
 
@@ -649,7 +698,6 @@ export const appRouter = router({  system: systemRouter,
           });
         }
         
-        const existingQAs = await db.getSessionQAs(input.sessionId);
         const previousQuestions = existingQAs.map(qa => qa.question).join("\n");
         const previousContext = existingQAs
           .filter(qa => qa.userAnswer)
@@ -665,36 +713,6 @@ export const appRouter = router({  system: systemRouter,
           company: "회사/직무 이해"
         };
         
-        // 질문 타이밍 정보 (초반/중반/후반)
-        const questionTimingInfo: Record<string, { timing: string; mood: string; answerStyle: string }> = {
-          personality: { 
-            timing: "초반", 
-            mood: "분위기 파악 단계", 
-            answerStyle: "자연스럽고 여유롭게 답변"
-          },
-          experience: { 
-            timing: "중반", 
-            mood: "분위기 좋을 때", 
-            answerStyle: "STAR 기법으로 구체적 사례 중심"
-          },
-          technical: { 
-            timing: "중반", 
-            mood: "집중 평가 단계", 
-            answerStyle: "논리적이고 구조화된 답변"
-          },
-          situational: { 
-            timing: "후반", 
-            mood: "분위기 안 나올 때 자주 나옴", 
-            answerStyle: "침착하고 단계적인 대응 강조"
-          },
-          company: { 
-            timing: "초반/후반", 
-            mood: "관심도 확인 단계", 
-            answerStyle: "열정과 준비성 강조"
-          }
-        };
-        const timingInfo = questionTimingInfo[questionType];
-
         // 이력서/자소서 기반 맞춤형 질문 생성
         const hasResumeOrCoverLetter = profile?.resume || profile?.coverLetter;
         
@@ -794,38 +812,66 @@ export const appRouter = router({  system: systemRouter,
           phaseLabel: currentPhase.label,
           timingInfo: timingInfo,
         };
+        });
       }),
     
     // 답변 제출 및 피드백 받기
     submitAnswer: protectedProcedure
       .input(z.object({
-        qaId: z.number(),
+        qaId: z.number().int().positive(),
         answer: z.string().trim().min(1).max(12_000),
+        answerDuration: z.number().int().min(0).max(3_600).optional(),
         answerStyle: z.enum(["short", "long"]).optional().default("long"),
         tensionLevel: z.enum(["high", "low"]).optional().default("low"),
         avatarSpeechStyle: z.object({
           formality: z.enum(['formal', 'semi-formal', 'casual']),
           questionStyle: z.enum(['direct', 'indirect', 'probing', 'friendly']),
           feedbackStyle: z.enum(['strict', 'encouraging', 'balanced', 'detailed']),
-          promptStyle: z.string(),
+          promptStyle: z.string().trim().max(400),
         }).optional(),
         followUpDifficulty: z.enum(['easy', 'medium', 'hard']).optional().default('medium'),
         // 후속 질문용 추가 필드
         isFollowUp: z.boolean().optional().default(false),
         followUpQuestion: z.string().trim().min(1).max(1_000).optional(),
-        sessionId: z.number().optional(),
+        sessionId: z.number().int().positive().optional(),
       }))
       .mutation(async ({ ctx, input }) => {
         let qa: Awaited<ReturnType<typeof db.getInterviewQAById>> | null = null;
+        let followUpParentQA: Awaited<ReturnType<typeof db.getInterviewQAById>> | null = null;
+        let pendingFollowUpId: number | null = null;
         let ownedSession: Awaited<ReturnType<typeof db.getInterviewSession>>;
         let questionText: string;
 
         if (input.isFollowUp) {
-          if (!input.followUpQuestion || !input.sessionId) {
-            throw new TRPCError({ code: "BAD_REQUEST", message: "후속 질문과 면접 세션이 필요합니다." });
+          if (!input.followUpQuestion) {
+            throw new TRPCError({ code: "BAD_REQUEST", message: "후속 질문이 필요합니다." });
           }
-          ownedSession = await requireOwnedInterviewSession(ctx.user.id, input.sessionId);
-          questionText = input.followUpQuestion;
+          const owned = await requireOwnedInterviewQa(ctx.user.id, input.qaId);
+          followUpParentQA = owned.qa;
+          ownedSession = owned.session;
+          if (!followUpParentQA.userAnswer?.trim()) {
+            throw new TRPCError({ code: "BAD_REQUEST", message: "원래 질문에 답변한 뒤 후속 질문을 진행해주세요." });
+          }
+          if (input.sessionId !== undefined && input.sessionId !== ownedSession.id) {
+            throw new TRPCError({ code: "BAD_REQUEST", message: "후속 질문의 면접 세션이 일치하지 않습니다." });
+          }
+
+          const history = await db.getFollowUpHistoryBySession(ctx.user.id, ownedSession.id);
+          if (getAnsweredUniqueFollowUps(history).length >= 1) {
+            throw new TRPCError({ code: "CONFLICT", message: "이 면접에서는 후속 질문 답변을 이미 완료했습니다." });
+          }
+          const normalizedQuestion = input.followUpQuestion.trim().replace(/\s+/g, " ");
+          const pendingFollowUp = history.find(item =>
+            !item.followUpAnswer &&
+            item.originalQuestion === followUpParentQA?.question &&
+            item.userAnswer === followUpParentQA?.userAnswer &&
+            item.followUpQuestion.trim().replace(/\s+/g, " ") === normalizedQuestion
+          );
+          if (!pendingFollowUp) {
+            throw new TRPCError({ code: "BAD_REQUEST", message: "현재 답변에서 생성된 후속 질문만 선택할 수 있습니다." });
+          }
+          pendingFollowUpId = pendingFollowUp.id;
+          questionText = pendingFollowUp.followUpQuestion;
         } else {
           const owned = await requireOwnedInterviewQa(ctx.user.id, input.qaId);
           qa = owned.qa;
@@ -836,6 +882,10 @@ export const appRouter = router({  system: systemRouter,
           }
         }
 
+        if (ownedSession.status !== "in_progress") {
+          throw new TRPCError({ code: "CONFLICT", message: "진행 중인 면접에서만 답변을 제출할 수 있습니다." });
+        }
+
         // 크레딧 확인 및 차감 (구독자/무료체험자는 제외)
         const subscription = await db.getUserActiveSubscription(ctx.user.id);
         const user = await db.getUserById(ctx.user.id);
@@ -843,7 +893,7 @@ export const appRouter = router({  system: systemRouter,
         const hasFreeTrial = user?.freeTrialEndsAt && new Date() < user.freeTrialEndsAt;
         let creditConsumed = false;
 
-        if (!hasSubscription && !hasFreeTrial) {
+        if (!input.isFollowUp && !hasSubscription && !hasFreeTrial) {
           const creditResult = await db.useQuestionCredit(ctx.user.id, 1);
           if (!creditResult.success) {
             throw new Error("크레딧이 부족합니다. 크레딧을 충전해주세요.");
@@ -853,6 +903,9 @@ export const appRouter = router({  system: systemRouter,
         
         const profile = await db.getUserProfile(ctx.user.id);
         const perspective = "구조화 면접 평가 루브릭";
+        const followUpContext = followUpParentQA
+          ? `\n원래 면접 질문: ${followUpParentQA.question}\n원래 지원자 답변: ${followUpParentQA.userAnswer}`
+          : "";
         
         const answerStyleGuide = input.answerStyle === "short"
           ? "지원자의 원답 사실만 유지해 1-2문장으로 고친 답변"
@@ -883,6 +936,7 @@ ${avatarFeedbackGuide}
 
 면접 질문: ${questionText}
 지원자 답변: ${input.answer}
+${followUpContext}
 
 지원자 배경:
 - 지원 회사: ${profile?.targetCompany || "정보 없음"}
@@ -963,6 +1017,7 @@ ${avatarStyle ? `문체만 위의 면접관 피드백 스타일을 반영하고 
         if (qa) {
           await db.updateInterviewQA(input.qaId, {
             userAnswer: input.answer,
+            answerDuration: input.answerDuration,
             feedback: feedbackData.feedback,
             score: feedbackData.score,
             strengths: feedbackData.strengths,
@@ -973,26 +1028,46 @@ ${avatarStyle ? `문체만 위의 면접관 피드백 스타일을 반영하고 
           // 세션 진행 상황 업데이트
           await db.incrementInterviewCompletedQuestions(ownedSession.id, ctx.user.id);
         }
-        
-        // 후속 질문 답변인 경우 히스토리에 저장
+
         let followUpHistoryId: number | null = null;
-        if (input.isFollowUp && input.followUpQuestion) {
+        let allowedFollowUpQuestions: string[] = [];
+        if (qa) {
+          const existingHistory = await db.getFollowUpHistoryBySession(ctx.user.id, ownedSession.id);
+          const firstFollowUp = Array.from(new Set(
+            feedbackData.followUpQuestions.map(question => question.trim()).filter(Boolean),
+          ))[0];
+          if (existingHistory.length === 0 && firstFollowUp) {
+            try {
+              const historyResult = await db.createFollowUpHistory({
+                userId: ctx.user.id,
+                sessionId: ownedSession.id,
+                originalQuestion: qa.question,
+                userAnswer: input.answer,
+                followUpQuestion: firstFollowUp,
+                difficulty: input.followUpDifficulty,
+                depth: 1,
+              });
+              followUpHistoryId = historyResult?.id || null;
+              allowedFollowUpQuestions = [firstFollowUp];
+            } catch (historyError) {
+              console.error('[submitAnswer] 후속 질문 선택지 저장 실패:', historyError);
+            }
+          }
+        } else if (pendingFollowUpId !== null) {
           try {
-            const historyResult = await db.createFollowUpHistory({
-              userId: ctx.user.id,
-              sessionId: input.sessionId,
-              originalQuestion: '', // 후속 질문의 경우 원래 질문은 비워둡
-              userAnswer: '', // 원래 답변도 비워둡
-              followUpQuestion: input.followUpQuestion,
+            const updated = await db.updateFollowUpAnswer(pendingFollowUpId, ctx.user.id, {
               followUpAnswer: input.answer,
               followUpFeedback: feedbackData.feedback,
               followUpScore: feedbackData.score,
-              difficulty: input.followUpDifficulty || 'medium',
-              depth: 1,
             });
-            followUpHistoryId = historyResult?.id || null;
+            if (!updated) {
+              throw new TRPCError({ code: "CONFLICT", message: "이 후속 질문에는 이미 답변했습니다." });
+            }
+            followUpHistoryId = pendingFollowUpId;
           } catch (historyError) {
+            if (historyError instanceof TRPCError) throw historyError;
             console.error('[submitAnswer] 후속 질문 히스토리 저장 실패:', historyError);
+            throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "후속 질문 답변을 저장하지 못했습니다." });
           }
         }
         
@@ -1014,7 +1089,7 @@ ${avatarStyle ? `문체만 위의 면접관 피드백 스타일을 반영하고 
           suggestedAnswerLong: feedbackData.suggestedAnswerLong,
           improvementGuide: feedbackData.improvementGuide,
           feedbackPerspective: perspective,
-          followUpQuestions: feedbackData.followUpQuestions || [],
+          followUpQuestions: allowedFollowUpQuestions,
           rubricScores: feedbackData.rubricScores,
           evidenceQuotes: feedbackData.evidenceQuotes,
           confidenceNote: feedbackData.confidenceNote,
@@ -1535,31 +1610,6 @@ JSON 형식으로 다음을 제공해주세요:
       return db.getUserTypePerformance(ctx.user.id);
     }),
     
-    // 후속 질문 히스토리 저장
-    saveFollowUpHistory: protectedProcedure
-      .input(z.object({
-        sessionId: z.number().int().positive().optional(),
-        originalQuestion: z.string().trim().min(1).max(1_000),
-        userAnswer: z.string().trim().max(12_000),
-        followUpQuestion: z.string().trim().min(1).max(1_000),
-        difficulty: z.enum(['easy', 'medium', 'hard']).optional().default('medium'),
-        depth: z.number().int().min(1).max(10).optional().default(1),
-      }))
-      .mutation(async ({ ctx, input }) => {
-        if (input.sessionId !== undefined) {
-          await requireOwnedInterviewSession(ctx.user.id, input.sessionId);
-        }
-        return db.createFollowUpHistory({
-          userId: ctx.user.id,
-          sessionId: input.sessionId,
-          originalQuestion: input.originalQuestion,
-          userAnswer: input.userAnswer,
-          followUpQuestion: input.followUpQuestion,
-          difficulty: input.difficulty,
-          depth: input.depth,
-        });
-      }),
-    
     // 후속 질문 히스토리 조회
     getFollowUpHistory: protectedProcedure.query(async ({ ctx }) => {
       return db.getFollowUpHistoryByUser(ctx.user.id);
@@ -1578,19 +1628,6 @@ JSON 형식으로 다음을 제공해주세요:
       }))
       .mutation(async ({ ctx, input }) => {
         await db.toggleFollowUpBookmark(input.id, ctx.user.id, input.isBookmarked);
-        return { success: true };
-      }),
-    
-    // 후속 질문 답변 업데이트
-    updateFollowUpAnswer: protectedProcedure
-      .input(z.object({
-        id: z.number(),
-        followUpAnswer: z.string().max(12_000).optional(),
-      }))
-      .mutation(async ({ ctx, input }) => {
-        await db.updateFollowUpAnswer(input.id, ctx.user.id, {
-          followUpAnswer: input.followUpAnswer,
-        });
         return { success: true };
       }),
     
@@ -2451,23 +2488,6 @@ JSON 형식으로 다음을 제공해주세요:
         
         return db.useQuestionCredit(ctx.user.id, input.count);
       }),
-    
-    // 크레딧 추가 (결제 후) - 내역 기록 포함
-    addCredits: protectedProcedure
-      .input(z.object({ 
-        credits: z.number(),
-        description: z.string().optional(),
-        paymentId: z.number().optional(),
-      }))
-      .mutation(async ({ ctx, input }) => {
-        return db.addQuestionCreditsWithHistory(
-          ctx.user.id, 
-          input.credits, 
-          input.description || `${input.credits}개 크레딧 구매`,
-          input.paymentId
-        );
-      }),
-    
     // 크레딧 내역 조회
     history: protectedProcedure
       .input(z.object({

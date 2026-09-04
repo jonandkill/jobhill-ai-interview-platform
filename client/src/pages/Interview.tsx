@@ -13,7 +13,8 @@ import { Progress } from "@/components/ui/progress";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Slider } from "@/components/ui/slider";
 import { trpc } from "@/lib/trpc";
-import { canContinueInterviewWizard, getQuestionRecoveryMessage, INTERVIEW_SETUP_LABELS, moveInterviewSetupStep, type InterviewSetupStep } from "@/lib/interviewWizard";
+import { canContinueInterviewWizard, getInterviewEntryDefaults, getQuestionRecoveryMessage, INTERVIEW_SETUP_LABELS, moveInterviewSetupStep, type InterviewSetupStep } from "@/lib/interviewWizard";
+import { acquireMediaStreamWithRetry, stopMediaStream } from "@/lib/mediaDeviceLifecycle";
 import { 
   ArrowRight, 
   Brain, 
@@ -36,12 +37,10 @@ import {
   Settings,
   Shield,
   AlertCircle,
-  GripVertical,
   Timer,
   Copy,
   Link2,
-  CheckCircle,
-  StopCircle
+  CheckCircle
 } from "lucide-react";
 import SocialShare from "@/components/SocialShare";
 import FreeLimitBanner from "@/components/FreeLimitBanner";
@@ -54,6 +53,7 @@ import { ReviewIncentiveDialog } from "@/components/ReviewIncentiveDialog";
 import InterviewMediaCheck from "@/components/InterviewMediaCheck";
 import InstantAnswerCorrection from "@/components/InstantAnswerCorrection";
 import InterviewCheckpoint from "@/components/InterviewCheckpoint";
+import DocumentIntakePanel from "@/components/DocumentIntakePanel";
 
 import AnalyzingLoader from "@/components/AnalyzingLoader";
 import { 
@@ -67,23 +67,6 @@ import {
 import { useState, useEffect, useCallback, useRef, type ChangeEvent } from "react";
 import { createPortal } from "react-dom";
 import { RadarChart, PolarGrid, PolarAngleAxis, PolarRadiusAxis, Radar, ResponsiveContainer, Tooltip } from "recharts";
-import {
-  DndContext,
-  closestCenter,
-  KeyboardSensor,
-  PointerSensor,
-  useSensor,
-  useSensors,
-  DragEndEvent,
-} from "@dnd-kit/core";
-import {
-  arrayMove,
-  SortableContext,
-  sortableKeyboardCoordinates,
-  useSortable,
-  verticalListSortingStrategy,
-} from "@dnd-kit/sortable";
-import { CSS } from "@dnd-kit/utilities";
 import { toast } from "sonner";
 import { Link, useLocation } from "wouter";
 import { Streamdown } from "streamdown";
@@ -124,6 +107,7 @@ interface QAItem {
   feedbackPerspective?: string | null;
   timingInfo?: TimingInfo | null;
   followUpQuestions?: string[] | null;
+  parentQaId?: number;
   keywords?: string[] | null;
   scoreDetails?: {
     logic: number;
@@ -139,55 +123,6 @@ interface BalanceAnalysis {
   technical: number;
   situational: number;
   company: number;
-}
-
-// 드래그 가능한 질문 아이템 컴포넌트
-function SortableQuestionItem({ id, question, index, onRemove }: {
-  id: string;
-  question: string;
-  index: number;
-  onRemove: () => void;
-}) {
-  const {
-    attributes,
-    listeners,
-    setNodeRef,
-    transform,
-    transition,
-    isDragging,
-  } = useSortable({ id });
-
-  const style = {
-    transform: CSS.Transform.toString(transform),
-    transition,
-    opacity: isDragging ? 0.5 : 1,
-  };
-
-  return (
-    <div
-      ref={setNodeRef}
-      style={style}
-      className={`flex items-center gap-2 p-2 bg-background rounded border ${
-        isDragging ? "border-primary shadow-lg" : "border-border"
-      }`}
-    >
-      <button
-        {...attributes}
-        {...listeners}
-        className="cursor-grab active:cursor-grabbing p-1 hover:bg-muted rounded"
-      >
-        <GripVertical className="w-4 h-4 text-muted-foreground" />
-      </button>
-      <span className="text-xs text-muted-foreground min-w-[20px]">{index + 1}.</span>
-      <span className="flex-1 text-sm truncate">{question}</span>
-      <button
-        onClick={onRemove}
-        className="p-1 hover:bg-destructive/10 rounded text-muted-foreground hover:text-destructive"
-      >
-        <span className="text-xs">✕</span>
-      </button>
-    </div>
-  );
 }
 
 // 저장 버튼 컴포넌트
@@ -247,7 +182,8 @@ function SavePracticeButton({ sessionId, qas, passRate, balanceAnalysis, profile
 }
 
 export default function Interview() {
-  const [, setLocation] = useLocation();
+  const [location, setLocation] = useLocation();
+  const entryDefaults = getInterviewEntryDefaults(location);
   const utils = trpc.useUtils();
   const { data: profile } = trpc.profile.get.useQuery();
   const { data: subscription } = trpc.subscription.current.useQuery();
@@ -276,16 +212,19 @@ export default function Interview() {
   const [wizardResume, setWizardResume] = useState("");
   const [wizardCoverLetter, setWizardCoverLetter] = useState("");
   const [planMode, setPlanMode] = useState<"structured" | "selected_only">("structured");
-  const [recordingMode, setRecordingMode] = useState<"manual" | "automatic">("manual");
+  const [recordingMode, setRecordingMode] = useState<"manual" | "automatic">(entryDefaults.recordingMode);
   const silenceThreshold = 8;
   const questionGenerationTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const questionGenerationRequestRef = useRef(0);
+  const expectedQuestionOrderRef = useRef<number | null>(null);
+  const expectedQuestionSessionRef = useRef<number | null>(null);
   const [currentQA, setCurrentQA] = useState<QAItem | null>(null);
   const [qas, setQas] = useState<QAItem[]>([]);
   const [answer, setAnswer] = useState("");
   const [questionIndex, setQuestionIndex] = useState(0);
   const [totalQuestions, setTotalQuestions] = useState(3);
   const [voiceMode, setVoiceMode] = useState(() => {
+    if (entryDefaults.voiceMode) return true;
     if (typeof window !== 'undefined') {
       const saved = localStorage.getItem('interviewVoiceMode');
       return saved === 'true';
@@ -311,8 +250,6 @@ export default function Interview() {
   const [customPitch, setCustomPitch] = useState(1.0); // 사용자 맞춤 음높이 (0.5 ~ 1.5, 기본값 1.0)
   
   // 음성 면접 흐름 개선을 위한 상태
-  const [showVoiceConfirmDialog, setShowVoiceConfirmDialog] = useState(false);
-  const [voiceConfirmType, setVoiceConfirmType] = useState<'retry' | 'next' | null>(null);
   const [showTimerBar, setShowTimerBar] = useState(true); // 타이머 바 표시/숨기기
   const [interimTranscript, setInterimTranscript] = useState(''); // 음성 인식 중간 결과
   const [showQuitConfirmDialog, setShowQuitConfirmDialog] = useState(false); // 중도 포기 확인 다이얼로그
@@ -338,32 +275,6 @@ export default function Interview() {
   
   // 사용자가 선택한 질문 목록
   const [selectedQuestions, setSelectedQuestions] = useState<string[]>([]);
-  
-  // 드래그 앤 드롭 센서 설정
-  const sensors = useSensors(
-    useSensor(PointerSensor, {
-      activationConstraint: {
-        distance: 8,
-      },
-    }),
-    useSensor(KeyboardSensor, {
-      coordinateGetter: sortableKeyboardCoordinates,
-    })
-  );
-  
-  // 드래그 종료 시 순서 변경 처리
-  const handleDragEnd = useCallback((event: DragEndEvent) => {
-    const { active, over } = event;
-    
-    if (over && active.id !== over.id) {
-      setSelectedQuestions((items) => {
-        const oldIndex = items.findIndex((item) => item === active.id);
-        const newIndex = items.findIndex((item) => item === over.id);
-        return arrayMove(items, oldIndex, newIndex);
-      });
-      toast.success("질문 순서가 변경되었습니다");
-    }
-  }, []);
   
   // 직군별 추천 답변 시간 데이터
   const jobCategoryTimers: Record<string, { label: string; seconds: number; description: string }> = {
@@ -425,7 +336,6 @@ export default function Interview() {
   
   // 답변 시간 측정 관련 상태
   const [answerStartTime, setAnswerStartTime] = useState<number | null>(null);
-  const [answerDuration, setAnswerDuration] = useState<number | null>(null); // 초 단위
   const [qaAnswerDurations, setQaAnswerDurations] = useState<Record<number, number>>({}); // qaId -> 답변 시간
   
   // 답변 수정 관련 상태
@@ -457,15 +367,19 @@ export default function Interview() {
   const autoRecordTimeoutRef = useRef<number | null>(null);
   const [audioChunks, setAudioChunks] = useState<Blob[]>([]);
   const [isRecording, setIsRecording] = useState(false);
-  const audioPlayerRef = useState<HTMLAudioElement | null>(null);
+  const audioPlayerRef = useRef<HTMLAudioElement | null>(null);
   const [isTranscribing, setIsTranscribing] = useState(false); // Whisper API 변환 중
   const [useWhisperApi, setUseWhisperApi] = useState(true); // Whisper API 사용 여부
+
+  useEffect(() => () => {
+    audioPlayerRef.current?.pause();
+    audioPlayerRef.current = null;
+    if (recordedAudioUrl) URL.revokeObjectURL(recordedAudioUrl);
+  }, [recordedAudioUrl]);
   
   // 후속 질문 관련 상태
   const [followUpDifficulty, setFollowUpDifficulty] = useState<'easy' | 'medium' | 'hard'>('medium'); // 후속 질문 난이도
-  const [continuousFollowUpMode, setContinuousFollowUpMode] = useState(false); // 꼬리 질문 연속 모드
   const [followUpCount, setFollowUpCount] = useState(0); // 현재 세션에서 후속 질문 횟수
-  const [maxFollowUpCount, setMaxFollowUpCount] = useState(3); // 최대 후속 질문 횟수
 
   // Whisper API 음성 인식 mutation
   const whisperTranscribeMutation = trpc.voice.transcribe.useMutation({
@@ -510,7 +424,7 @@ export default function Interview() {
       recorder.onerror = null;
       recorder.stop();
     }
-    recordingStreamRef.current?.getTracks().forEach(track => track.stop());
+    stopMediaStream(recordingStreamRef.current);
     recordingStreamRef.current = null;
     void recordingAudioContextRef.current?.close().catch(() => undefined);
     recordingAudioContextRef.current = null;
@@ -566,9 +480,13 @@ export default function Interview() {
       if (!navigator.mediaDevices?.getUserMedia) {
         throw new Error("이 브라우저는 마이크를 지원하지 않습니다.");
       }
-      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      stream = await acquireMediaStreamWithRetry({
+        getUserMedia: constraints => navigator.mediaDevices.getUserMedia(constraints),
+        constraints: { audio: true },
+        maxBusyRetries: 1,
+      });
       if (statusRef.current !== "answering") {
-        stream.getTracks().forEach(track => track.stop());
+        stopMediaStream(stream);
         return;
       }
 
@@ -598,7 +516,7 @@ export default function Interview() {
           clearInterval(recordingSilenceIntervalRef.current);
           recordingSilenceIntervalRef.current = null;
         }
-        stream?.getTracks().forEach(track => track.stop());
+        stopMediaStream(stream);
         if (recordingStreamRef.current === stream) recordingStreamRef.current = null;
         void audioContext?.close().catch(() => undefined);
         if (recordingAudioContextRef.current === audioContext) recordingAudioContextRef.current = null;
@@ -628,6 +546,7 @@ export default function Interview() {
       };
 
       recorder.start(1000);
+      setAnswerStartTime(Date.now());
       setAudioChunks(chunks);
       setIsRecording(true);
       setIsListening(true);
@@ -659,7 +578,7 @@ export default function Interview() {
         }, 250);
       }
     } catch (error) {
-      stream?.getTracks().forEach(track => track.stop());
+      stopMediaStream(stream);
       void audioContext?.close().catch(() => undefined);
       if (recordingStreamRef.current === stream) recordingStreamRef.current = null;
       if (recordingAudioContextRef.current === audioContext) recordingAudioContextRef.current = null;
@@ -686,9 +605,18 @@ export default function Interview() {
   // 녹음 재생
   const playRecording = () => {
     if (recordedAudioUrl) {
+      audioPlayerRef.current?.pause();
       const audio = new Audio(recordedAudioUrl);
-      audio.onended = () => setIsPlayingRecording(false);
-      audio.play();
+      audioPlayerRef.current = audio;
+      audio.onended = () => {
+        if (audioPlayerRef.current === audio) audioPlayerRef.current = null;
+        setIsPlayingRecording(false);
+      };
+      void audio.play().catch(() => {
+        if (audioPlayerRef.current === audio) audioPlayerRef.current = null;
+        setIsPlayingRecording(false);
+        toast.error("녹음 답변을 재생하지 못했습니다.");
+      });
       setIsPlayingRecording(true);
     }
   };
@@ -1148,7 +1076,16 @@ export default function Interview() {
     }
   };
   
-  const speakQuestion = async (text: string) => {
+  function startAnswerTimer(question: string) {
+    if (!timerEnabled || statusRef.current !== "answering") return;
+    const duration = autoTimerEnabled ? getAutoTimerDuration(question) : timerDuration;
+    setTimeRemaining(duration);
+    setTimerActive(true);
+    setTimerOvertime(false);
+    setOvertimeSeconds(0);
+  }
+
+  const speakQuestion = async (text: string, startAnswerAfterPlayback = false) => {
     if (!ttsEnabled || !voiceMode) return;
     
     // 이전 오디오 중지
@@ -1207,14 +1144,7 @@ export default function Interview() {
         setIsSpeaking(false);
         
         // AI 음성 완료 후 타이머 시작
-        if (voiceMode && timerEnabled && status === 'answering') {
-          const duration = autoTimerEnabled ? getAutoTimerDuration(text) : timerDuration;
-          console.log('[타이머] AI 음성 완료 후 타이머 시작:', duration, '초');
-          setTimeRemaining(duration);
-          setTimerActive(true);
-          setTimerOvertime(false);
-          setOvertimeSeconds(0);
-        }
+        if (startAnswerAfterPlayback) startAnswerTimer(text);
         
         // 음성 면접 안내 메시지
         if (voiceMode) {
@@ -1236,6 +1166,7 @@ export default function Interview() {
         toast.error('음성 재생 중 오류가 발생했습니다.');
         setIsSpeaking(false);
         setIsTTSLoading(false);
+        if (startAnswerAfterPlayback) startAnswerTimer(text);
       };
       
       // autoplay 정책 대응: 오디오 컨텍스트 활성화 확인
@@ -1268,13 +1199,7 @@ export default function Interview() {
         duration: 3000,
       });
 
-      if (voiceMode && timerEnabled && status === "answering") {
-        const duration = autoTimerEnabled ? getAutoTimerDuration(text) : timerDuration;
-        setTimeRemaining(duration);
-        setTimerActive(true);
-        setTimerOvertime(false);
-        setOvertimeSeconds(0);
-      }
+      if (startAnswerAfterPlayback) startAnswerTimer(text);
 
       if (voiceMode && recordingMode === "automatic") {
         const readingDelay = Math.max(2500, Math.min(9000, text.length * 110));
@@ -1430,23 +1355,8 @@ export default function Interview() {
     };
   }, [voiceMode, isListening, status, lastSpeechTime, showSilenceWarning]);
 
-  // 텍스트 읽기 시간 계산 함수 (한글 기준: 분당 300자, 영어: 분당 200단어)
-  const calculateReadingTime = (text: string): number => {
-    const koreanChars = (text.match(/[\u3131-\u318E\uAC00-\uD7A3]/g) || []).length;
-    const englishWords = (text.match(/[a-zA-Z]+/g) || []).length;
-    const numbers = (text.match(/[0-9]+/g) || []).length;
-    
-    // 한글: 분당 300자 = 초당 5자
-    // 영어: 분당 200단어 = 초당 3.3단어
-    // 숫자: 분당 150개 = 초당 2.5개
-    const readingTimeSeconds = (koreanChars / 5) + (englishWords / 3.3) + (numbers / 2.5);
-    
-    // 최소 2초, 최대 10초
-    return Math.max(2, Math.min(10, Math.ceil(readingTimeSeconds)));
-  };
-
   // 질문 유형에 따른 자동 타이머 설정 함수
-  const getAutoTimerDuration = (question: string): number => {
+  function getAutoTimerDuration(question: string): number {
     // 질문 내용을 분석하여 유형 파악 - 실제 면접 기준 최적화
     const questionLower = question.toLowerCase();
     
@@ -1534,45 +1444,7 @@ export default function Interview() {
     
     // 기본값 (30초)
     return questionTypeTimers['기타'].seconds;
-  };
-
-  // 질문 생성 시 타이머 시작 - 음성 모드에서는 질문 읽기 완료 후 시작, 텍스트 모드에서는 읽기 시간 후 시작
-  useEffect(() => {
-    if (status === 'answering' && timerEnabled && currentQA) {
-      // 음성 모드이고 TTS가 활성화되어 있으면 질문 읽기 완료 후 타이머 시작
-      if (voiceMode && ttsEnabled && isSpeaking) {
-        // 질문 읽는 중이면 타이머 시작하지 않음
-        return;
-      }
-      
-      // 자동 타이머 설정이 활성화되어 있으면 질문 유형에 따라 타이머 설정
-      const duration = autoTimerEnabled ? getAutoTimerDuration(currentQA.question) : timerDuration;
-      
-      // 텍스트 모드에서는 읽기 시간 후 타이머 시작
-      if (!voiceMode || !ttsEnabled) {
-        const readingTime = calculateReadingTime(currentQA.question);
-        toast.info(`질문을 읽는 시간 ${readingTime}초 후 타이머가 시작됩니다`, { duration: readingTime * 1000 });
-        
-        setTimeout(() => {
-          setTimeRemaining(duration);
-          setTimerActive(true);
-          setTimerOvertime(false);
-          setOvertimeSeconds(0);
-          toast.success('타이머 시작! 답변을 시작하세요.', { duration: 2000 });
-        }, readingTime * 1000);
-      } else {
-        // 음성 모드에서는 즉시 설정 (TTS 완료 후 시작)
-        setTimeRemaining(duration);
-        setTimerActive(true);
-        setTimerOvertime(false);
-        setOvertimeSeconds(0);
-      }
-    } else if (status !== 'answering') {
-      setTimerActive(false);
-      setTimerOvertime(false);
-      setOvertimeSeconds(0);
-    }
-  }, [status, timerEnabled, timerDuration, currentQA, autoTimerEnabled, voiceMode, ttsEnabled, isSpeaking]);
+  }
 
   const startMutation = trpc.interview.start.useMutation({
     onSuccess: (data) => {
@@ -1594,7 +1466,13 @@ export default function Interview() {
   });
 
   const generateMutation = trpc.interview.generateQuestion.useMutation({
-    onSuccess: (data) => {
+    onSuccess: (data, variables) => {
+      if (
+        expectedQuestionOrderRef.current !== data.questionOrder ||
+        expectedQuestionSessionRef.current !== variables.sessionId
+      ) return;
+      expectedQuestionOrderRef.current = null;
+      expectedQuestionSessionRef.current = null;
       if (questionGenerationTimeoutRef.current) {
         clearTimeout(questionGenerationTimeoutRef.current);
         questionGenerationTimeoutRef.current = null;
@@ -1606,22 +1484,29 @@ export default function Interview() {
         questionType: data.questionType || "personality",
         phaseId: data.phaseId,
         phaseLabel: data.phaseLabel,
+        timingInfo: data.timingInfo,
       };
       setCurrentQA(qa);
+      statusRef.current = "answering";
       setStatus("answering");
       
-      // 답변 시작 시간 기록
-      setAnswerStartTime(Date.now());
-      setAnswerDuration(null);
+      // 실제 답변 시간은 녹음 시작 또는 첫 텍스트 입력부터 측정합니다.
+      setAnswerStartTime(null);
       
       // 음성 모드: 바로 TTS 재생
       if (voiceMode && ttsEnabled) {
-        setTimeout(() => {
-          speakQuestion(data.question);
-        }, 500);
+        void speakQuestion(data.question, true);
+      } else {
+        startAnswerTimer(data.question);
       }
     },
-    onError: (error) => {
+    onError: (error, variables) => {
+      if (
+        expectedQuestionOrderRef.current !== variables.questionOrder ||
+        expectedQuestionSessionRef.current !== variables.sessionId
+      ) return;
+      expectedQuestionOrderRef.current = null;
+      expectedQuestionSessionRef.current = null;
       if (questionGenerationTimeoutRef.current) {
         clearTimeout(questionGenerationTimeoutRef.current);
         questionGenerationTimeoutRef.current = null;
@@ -1675,7 +1560,7 @@ export default function Interview() {
   const completeMutation = trpc.interview.complete.useMutation({
     onSuccess: (data) => {
       setStatus("completed");
-      setPassRate(data.session?.passRate || null);
+      setPassRate(data.session?.passRate ?? null);
       
       // balanceAnalysis 안전하게 파싱
       let parsedBalanceAnalysis: BalanceAnalysis | null = null;
@@ -1768,11 +1653,15 @@ export default function Interview() {
       clearTimeout(questionGenerationTimeoutRef.current);
     }
     const requestId = ++questionGenerationRequestRef.current;
+    expectedQuestionOrderRef.current = index;
+    expectedQuestionSessionRef.current = sid;
     setQuestionGenerationError(null);
     if (!currentQA) setStatus("in_progress");
     questionGenerationTimeoutRef.current = setTimeout(() => {
       if (requestId !== questionGenerationRequestRef.current) return;
       generateMutation.reset();
+      expectedQuestionOrderRef.current = null;
+      expectedQuestionSessionRef.current = null;
       setQuestionGenerationError(getQuestionRecoveryMessage(true));
       setStatus(currentQA ? "feedback" : "in_progress");
     }, 15000);
@@ -1836,9 +1725,11 @@ export default function Interview() {
 
     setQuestionGenerationError(null);
     setQuestionIndex(0);
+    setFollowUpCount(0);
     setCurrentQA(null);
     setQas([]);
     setAnswer("");
+    setRecordedAudioUrl(null);
     startInterview();
   };
   
@@ -1873,7 +1764,7 @@ export default function Interview() {
 
     setStatus("starting");
     startMutation.mutate({
-      sessionType: "mock_interview",
+      sessionType: voiceMode ? "voice_interview" : "mock_interview",
       totalQuestions,
       isVoiceMode: voiceMode,
       selectedQuestions: selectedQuestions.length > 0 ? selectedQuestions : undefined,
@@ -1887,12 +1778,13 @@ export default function Interview() {
       return;
     }
     if (!currentQA) return;
+    setTimerActive(false);
+    setTimerOvertime(false);
     
     // 답변 시간 계산
     let duration = 0;
     if (answerStartTime) {
       duration = Math.round((Date.now() - answerStartTime) / 1000);
-      setAnswerDuration(duration);
       setQaAnswerDurations(prev => ({ ...prev, [currentQA.id]: duration }));
     }
     
@@ -1902,7 +1794,7 @@ export default function Interview() {
     const isFollowUp = currentQA.questionType === 'follow_up';
     
     submitMutation.mutate({
-      qaId: currentQA.id,
+      qaId: isFollowUp ? currentQA.parentQaId ?? currentQA.id : currentQA.id,
       answer: answer.trim(),
       avatarSpeechStyle: {
         formality: selectedAvatar.speechStyle.formality,
@@ -1915,6 +1807,7 @@ export default function Interview() {
       isFollowUp: isFollowUp,
       followUpQuestion: isFollowUp ? currentQA.question : undefined,
       sessionId: sessionId || undefined,
+      answerDuration: duration,
     });
   };
 
@@ -1927,11 +1820,32 @@ export default function Interview() {
     } else {
       setQuestionIndex(nextIndex);
       setAnswer("");
+      setRecordedAudioUrl(null);
       setQuestionGenerationError(null);
       if (sessionId) {
         generateQuestion(sessionId, nextIndex);
       }
     }
+  };
+
+  const handleStartFollowUp = () => {
+    const followUpQuestion = currentQA?.followUpQuestions?.[0];
+    if (!currentQA || currentQA.questionType === "follow_up" || followUpCount > 0 || !followUpQuestion) return;
+
+    setCurrentQA({
+      id: Date.now(),
+      question: followUpQuestion,
+      questionType: "follow_up",
+      parentQaId: currentQA.id,
+    });
+    setAnswer("");
+    setRecordedAudioUrl(null);
+    setAnswerStartTime(null);
+    setFollowUpCount(1);
+    statusRef.current = "answering";
+    setStatus("answering");
+    if (voiceMode && ttsEnabled) void speakQuestion(followUpQuestion, true);
+    else startAnswerTimer(followUpQuestion);
   };
 
   const getQuestionTypeLabel = (type: string) => {
@@ -1961,7 +1875,7 @@ export default function Interview() {
     if (setupStep >= 0) {
       return (
         <DashboardLayout>
-          <div className="max-w-xl mx-auto px-4 py-6 sm:py-10">
+          <div className={`${setupStep === 1 ? "max-w-5xl" : "max-w-xl"} mx-auto px-4 py-6 sm:py-10`}>
             <div className="mb-6 flex items-center justify-between gap-3">
               <div>
                 <p className="text-xs font-semibold tracking-widest text-primary uppercase">AI Mock Interview</p>
@@ -2033,21 +1947,23 @@ export default function Interview() {
                         </div>
                       </div>
                     </div>
-                    <div className="rounded-xl border p-4 space-y-4">
-                      <div>
-                        <p className="font-medium">방법 2. 이력서 또는 자기소개서</p>
-                        <p className="mt-1 text-xs text-muted-foreground">필요한 부분을 그대로 붙여넣으면 역할·성과·강조 꼭지를 바탕으로 질문합니다.</p>
+                    <DocumentIntakePanel
+                      onResumeApply={setWizardResume}
+                      onCoverLetterApply={setWizardCoverLetter}
+                    />
+                    <details className="rounded-xl border p-4">
+                      <summary className="cursor-pointer font-medium">파일이 없으면 텍스트 직접 붙여넣기</summary>
+                      <div className="mt-4 space-y-4">
+                        <div className="space-y-2">
+                          <Label htmlFor="wizard-resume">이력서 내용</Label>
+                          <Textarea id="wizard-resume" value={wizardResume} onChange={(event) => setWizardResume(event.target.value)} placeholder="경력, 프로젝트, 역할, 성과를 붙여넣어 주세요." className="min-h-28" maxLength={12_000} />
+                        </div>
+                        <div className="space-y-2">
+                          <Label htmlFor="wizard-cover-letter">자기소개서 내용</Label>
+                          <Textarea id="wizard-cover-letter" value={wizardCoverLetter} onChange={(event) => setWizardCoverLetter(event.target.value)} placeholder="지원 동기와 주요 경험을 붙여넣어 주세요." className="min-h-28" maxLength={12_000} />
+                        </div>
                       </div>
-                      <div className="space-y-2">
-                        <Label htmlFor="wizard-resume">이력서 내용</Label>
-                        <Textarea id="wizard-resume" value={wizardResume} onChange={(event) => setWizardResume(event.target.value)} placeholder="경력, 프로젝트, 역할, 성과를 붙여넣어 주세요." className="min-h-28" maxLength={100000} />
-                      </div>
-                      <div className="space-y-2">
-                        <Label htmlFor="wizard-cover-letter">자기소개서 내용</Label>
-                        <Textarea id="wizard-cover-letter" value={wizardCoverLetter} onChange={(event) => setWizardCoverLetter(event.target.value)} placeholder="지원 동기와 주요 경험을 붙여넣어 주세요." className="min-h-28" maxLength={100000} />
-                      </div>
-                      <p className="text-xs leading-5 text-muted-foreground">영상·음성 원본은 이 입력에 저장하지 않습니다. PDF·DOCX 자동 추출은 안전한 파일 검증 기능을 추가한 뒤 제공할 예정입니다.</p>
-                    </div>
+                    </details>
                     <div className="flex items-center gap-2 rounded-lg bg-muted/40 p-3 text-sm">
                       {canMoveFromProfile ? <CheckCircle2 className="h-4 w-4 text-green-600" /> : <AlertCircle className="h-4 w-4 text-amber-600" />}
                       {canMoveFromProfile ? "면접 질문을 만들 준비가 되었습니다." : "문서 하나를 붙여넣거나 회사와 직무를 모두 입력해주세요."}
@@ -2164,862 +2080,10 @@ export default function Interview() {
         </DashboardLayout>
       );
     }
-
-    return (
-      <DashboardLayout>
-        <div className="max-w-3xl mx-auto space-y-6 px-4 sm:px-0">
-          <div className="text-center">
-            <div className="w-14 h-14 sm:w-16 sm:h-16 rounded-full bg-primary/10 flex items-center justify-center mx-auto mb-4">
-              <Brain className="w-7 h-7 sm:w-8 sm:h-8 text-primary" />
-            </div>
-            <h1 className="text-xl sm:text-2xl font-bold mb-2">AI 모의 면접</h1>
-            <p className="text-sm sm:text-base text-muted-foreground">
-              실전처럼 면접을 연습하고 상세한 피드백을 받아보세요
-            </p>
-          </div>
-
-          {/* 이력서/자소서 등록 유도 배너 */}
-          {(!profile?.resume && !profile?.coverLetter) && (
-            <Card className="bg-gradient-to-r from-blue-50 to-indigo-50 border-blue-200">
-              <CardContent className="p-4">
-                <div className="flex items-start gap-3">
-                  <div className="w-10 h-10 rounded-full bg-blue-100 flex items-center justify-center shrink-0">
-                    <FileText className="w-5 h-5 text-blue-600" />
-                  </div>
-                  <div className="flex-1">
-                    <p className="font-medium text-blue-900 mb-1">이력서/자소서를 등록하면 더 다채로운 답변을 받을 수 있어요!</p>
-                    <p className="text-sm text-blue-700 mb-3">
-                      귀하의 경험과 역량을 바탕으로 맞춤형 질문과 피드백을 제공합니다.
-                    </p>
-                    <Link href="/profile">
-                      <Button size="sm" className="gap-2 bg-blue-600 hover:bg-blue-700">
-                        <FileText className="w-4 h-4" />
-                        지금 등록하기
-                      </Button>
-                    </Link>
-                  </div>
-                </div>
-              </CardContent>
-            </Card>
-          )}
-
-          <Card>
-            <CardHeader>
-              <CardTitle className="text-lg">면접 정보</CardTitle>
-              <CardDescription>현재 설정된 지원 정보입니다</CardDescription>
-            </CardHeader>
-            <CardContent className="space-y-4">
-              <div className="grid sm:grid-cols-2 gap-4">
-                <div className="p-4 rounded-lg bg-secondary/30">
-                  <p className="text-sm text-muted-foreground mb-1">지원 회사</p>
-                  <p className="font-medium">{profile?.targetCompany || "미설정"}</p>
-                </div>
-                <div className="p-4 rounded-lg bg-secondary/30">
-                  <p className="text-sm text-muted-foreground mb-1">지원 직무</p>
-                  <p className="font-medium">{profile?.targetPosition || "미설정"}</p>
-                </div>
-              </div>
-              
-              {/* 이력서/자소서 등록 상태 표시 */}
-              <div className="grid sm:grid-cols-2 gap-4">
-                <div className={`p-3 rounded-lg ${profile?.resume ? 'bg-green-900/20 border border-green-700' : 'bg-slate-800 border border-slate-700'}`}>
-                  <div className="flex items-center gap-2">
-                    {profile?.resume ? (
-                      <CheckCircle2 className="w-4 h-4 text-green-600" />
-                    ) : (
-                      <AlertCircle className="w-4 h-4 text-gray-400" />
-                    )}
-                    <span className={`text-sm ${profile?.resume ? 'text-green-700' : 'text-gray-500'}`}>
-                      이력서 {profile?.resume ? '등록됨' : '미등록'}
-                    </span>
-                  </div>
-                </div>
-                <div className={`p-3 rounded-lg ${profile?.coverLetter ? 'bg-green-900/20 border border-green-700' : 'bg-slate-800 border border-slate-700'}`}>
-                  <div className="flex items-center gap-2">
-                    {profile?.coverLetter ? (
-                      <CheckCircle2 className="w-4 h-4 text-green-600" />
-                    ) : (
-                      <AlertCircle className="w-4 h-4 text-gray-400" />
-                    )}
-                    <span className={`text-sm ${profile?.coverLetter ? 'text-green-700' : 'text-gray-500'}`}>
-                      자소서 {profile?.coverLetter ? '등록됨' : '미등록'}
-                    </span>
-                  </div>
-                </div>
-              </div>
-              
-              {(!profile?.targetCompany || !profile?.targetPosition) && (
-                <div className="p-4 rounded-lg bg-yellow-50 border border-yellow-200 text-yellow-800">
-                  <p className="text-sm">
-                    면접을 시작하려면 먼저 프로필에서 지원 회사와 직무를 설정해주세요.
-                  </p>
-                  <Link href="/profile">
-                    <Button variant="link" className="p-0 h-auto text-yellow-800 underline">
-                      프로필 설정하기
-                    </Button>
-                  </Link>
-                </div>
-              )}
-            </CardContent>
-          </Card>
-
-          {/* 음성 모드 옵션 */}
-          <Card>
-            <CardHeader>
-              <CardTitle className="text-lg flex items-center gap-2">
-                <Mic className="w-5 h-5" />
-                면접 모드 선택
-              </CardTitle>
-            </CardHeader>
-            <CardContent className="space-y-4">
-              <div 
-                className={`flex items-center justify-between p-4 rounded-lg border cursor-pointer transition-all ${!voiceMode ? 'border-primary bg-primary/5' : 'hover:border-primary/50'}`}
-                onClick={() => setVoiceMode(false)}
-              >
-                <div className="flex items-center gap-3">
-                  <div className="w-10 h-10 rounded-lg bg-primary/10 flex items-center justify-center">
-                    <MessageSquare className="w-5 h-5 text-primary" />
-                  </div>
-                  <div>
-                    <p className="font-medium">텍스트 면접</p>
-                    <p className="text-sm text-muted-foreground">채팅 형식으로 면접 진행</p>
-                  </div>
-                </div>
-                <Badge variant={!voiceMode ? "default" : "secondary"}>{!voiceMode ? '선택됨' : '기본'}</Badge>
-              </div>
-
-              {/* 텍스트 모드 선택 시 음성 유도 문구 */}
-              {!voiceMode && canUseVoiceMode && (
-                <div className="p-3 bg-gradient-to-r from-gold/10 to-orange-100 border border-gold/30 rounded-lg">
-                  <p className="text-sm text-center">
-                    <Mic className="w-4 h-4 inline mr-1 text-gold" />
-                    <span className="font-medium text-gold">팁!</span> 음성 면접을 이용하면 실제 면접처럼 연습할 수 있어 <span className="font-bold">더 효과적</span>입니다!
-                  </p>
-                </div>
-              )}
-
-              <div 
-                className={`flex items-center justify-between p-4 rounded-lg border cursor-pointer transition-all ${voiceMode ? 'border-gold bg-gold/5 shadow-md' : 'hover:border-gold/50'} ${!canUseVoiceMode ? 'opacity-60 cursor-not-allowed' : ''}`}
-                onClick={() => canUseVoiceMode && setVoiceMode(true)}
-              >
-                <div className="flex items-center gap-3">
-                  <div className={`w-10 h-10 rounded-lg flex items-center justify-center ${voiceMode ? 'bg-gold/20' : 'bg-gold/10'}`}>
-                    <Mic className={`w-5 h-5 ${voiceMode ? 'text-gold animate-pulse' : 'text-gold'}`} />
-                  </div>
-                  <div>
-                    <p className="font-medium">음성 면접</p>
-                    <p className="text-sm text-muted-foreground">실제 면접처럼 음성으로 진행</p>
-                  </div>
-                </div>
-                <div className="flex items-center gap-3">
-                  {!subscription && voiceUsageCount === 0 && (
-                    <Badge variant="secondary" className="text-xs bg-green-100 text-green-700">🎁 1회 무료</Badge>
-                  )}
-                  {!subscription && voiceUsageCount >= 1 && (
-                    <Badge variant="outline" className="text-xs">무료 사용 완료</Badge>
-                  )}
-                  {subscription && (subscription.planType === "premium" || (subscription as any)?.plan === "premium_plus") && (
-                    <Badge variant="secondary" className="text-xs bg-gold/20 text-gold">프리미엄</Badge>
-                  )}
-                  {voiceMode && (
-                    <Badge className="bg-gold text-white">선택됨</Badge>
-                  )}
-                  <Switch
-                    checked={voiceMode}
-                    onCheckedChange={setVoiceMode}
-                    disabled={!canUseVoiceMode}
-                  />
-                </div>
-              </div>
-
-              {!subscription && voiceUsageCount === 0 && !hasCouponFreeTime && (
-                <p className="text-xs text-green-600 text-center font-medium">
-                  🎉 첫 방문 특별 혜택! 음성 면접을 1회 무료로 체험해보세요.
-                </p>
-              )}
-              {hasCouponFreeTime && (
-                <p className="text-xs text-amber-600 text-center font-medium">
-                  🎁 쿠폰 무료 시간: {couponFreeTime?.remainingMinutes}분 남음 - 음성 면접을 이용하실 수 있습니다!
-                </p>
-              )}
-              {!canUseVoiceMode && voiceUsageCount >= 1 && !hasCouponFreeTime && (
-                <p className="text-xs text-muted-foreground text-center">
-                  무료 체험을 완료하셨습니다. 계속 사용하려면 프리미엄+ 구독 또는 음성 1회권을 구매해주세요.{" "}
-                  <Link href="/pricing">
-                    <span className="text-primary underline cursor-pointer">요금제 보기</span>
-                  </Link>
-                </p>
-              )}
-              
-              {/* 음성 면접 설정 옵션 */}
-              {voiceMode && (
-                <div className="mt-4 p-4 bg-gradient-to-r from-gold/5 to-orange-50 rounded-lg border border-gold/20 space-y-4">
-                  <p className="text-sm font-medium text-gold flex items-center gap-2">
-                    ⚙️ 음성 면접 설정
-                  </p>
-                  
-                  {/* 아바타 음성 정보 */}
-                  <div className="p-3 bg-gold/5 rounded-lg border border-gold/20">
-                    <div className="flex items-center gap-2 mb-2">
-                      <span className="text-lg">{selectedAvatar.emoji}</span>
-                      <div>
-                        <p className="text-xs font-medium">{selectedAvatar.name}</p>
-                        <p className="text-xs text-muted-foreground">
-                          {selectedAvatar.voiceType.includes('female') ? '여성 음성' : '남성 음성'} 자동 적용
-                        </p>
-                      </div>
-                    </div>
-                    <p className="text-xs text-muted-foreground">
-                      아바타 성별에 따라 음성이 자동으로 선택됩니다.
-                    </p>
-                  </div>
-                  
-                  {/* 음성 속도 조절 */}
-                  <div className="space-y-2">
-                    <label className="text-xs font-medium text-muted-foreground flex items-center justify-between">
-                      <span>음성 속도</span>
-                      <span className="text-gold">{ttsSpeed}배속</span>
-                    </label>
-                    <div className="flex items-center gap-2">
-                      <span className="text-xs text-muted-foreground">느림</span>
-                      <input
-                        type="range"
-                        min="0.8"
-                        max="1.5"
-                        step="0.1"
-                        value={ttsSpeed}
-                        onChange={(e) => setTtsSpeed(parseFloat(e.target.value))}
-                        className="flex-1 h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer accent-gold"
-                      />
-                      <span className="text-xs text-muted-foreground">빠름</span>
-                    </div>
-                  </div>
-                  
-                  {/* 타이머 바 표시 설정 */}
-                  <div className="flex items-center justify-between">
-                    <label className="text-xs font-medium text-muted-foreground">타이머 바 표시</label>
-                    <Switch
-                      checked={showTimerBar}
-                      onCheckedChange={setShowTimerBar}
-                    />
-                  </div>
-                  
-                  {/* 음성 인식 힌트 */}
-                  <div className="mt-3 p-2 bg-blue-50 border border-blue-200 rounded-lg">
-                    <p className="text-xs text-blue-700">
-                      {generateSpeechHintMessage(profile?.targetCompany || undefined, profile?.targetPosition || undefined)}
-                    </p>
-                  </div>
-                </div>
-              )}
-            </CardContent>
-          </Card>
-
-          {/* 무료 제한 배너 */}
-          <FreeLimitBanner variant="inline" />
-
-          <Card>
-            <CardHeader>
-              <CardTitle className="text-lg">면접 진행 안내</CardTitle>
-            </CardHeader>
-            <CardContent>
-              <ul className="space-y-3 text-sm sm:text-base">
-                <li className="flex items-start gap-3">
-                  <CheckCircle2 className="w-5 h-5 text-green-500 mt-0.5 shrink-0" />
-                  <span>총 {totalQuestions}개의 질문이 출제됩니다</span>
-                </li>
-                <li className="flex items-start gap-3">
-                  <CheckCircle2 className="w-5 h-5 text-green-500 mt-0.5 shrink-0" />
-                  <span>각 질문에 대해 답변을 작성하면 AI가 피드백을 제공합니다</span>
-                </li>
-                <li className="flex items-start gap-3">
-                  <CheckCircle2 className="w-5 h-5 text-green-500 mt-0.5 shrink-0" />
-                  <span>면접 완료 후 답변 준비도와 영역별 연습 지표를 확인할 수 있습니다</span>
-                </li>
-              </ul>
-              
-              {/* 자소서 저장 안내 */}
-              {!profile?.coverLetter && (
-                <div className="mt-4 p-3 bg-gradient-to-r from-amber-50 to-orange-50 border border-amber-200 rounded-lg">
-                  <div className="flex items-start gap-2">
-                    <span className="text-amber-600 text-lg">💡</span>
-                    <div>
-                      <p className="text-sm font-medium text-amber-800">프로필에 자기소개서를 저장하면 더 정확한 질문이 나와요!</p>
-                      <p className="text-xs text-amber-700 mt-1">
-                        자소서 내용을 기반으로 실제 면접과 유사한 적중률 높은 질문을 생성합니다.
-                      </p>
-                      <Link href="/profile">
-                        <Button variant="outline" size="sm" className="mt-2 text-amber-700 border-amber-300 hover:bg-amber-100">
-                          프로필 관리로 이동 →
-                        </Button>
-                      </Link>
-                    </div>
-                  </div>
-                </div>
-              )}
-              {profile?.coverLetter && (
-                <div className="mt-4 p-3 bg-gradient-to-r from-green-50 to-emerald-50 border border-green-200 rounded-lg">
-                  <div className="flex items-center gap-2">
-                    <span className="text-green-600 text-lg">✅</span>
-                    <p className="text-sm font-medium text-green-800">자기소개서가 등록되어 있어 적중률 높은 질문이 생성됩니다!</p>
-                  </div>
-                </div>
-              )}
-            </CardContent>
-          </Card>
-
-          {/* 대표 질문 추천 */}
-          <PopularQuestions 
-            maxSelections={3}
-            hasProfile={!!(profile?.resume || profile?.coverLetter)}
-            profileResume={profile?.resume}
-            profileCoverLetter={profile?.coverLetter}
-            onSelectQuestions={(questions) => {
-              setSelectedQuestions(questions);
-            }}
-            onStartInterview={(questions) => {
-              // 선택된 질문으로 바로 면접 시작
-              if (!profile?.targetCompany || !profile?.targetPosition) {
-                toast.error("먼저 프로필에서 지원 회사와 직무를 입력해주세요");
-                return;
-              }
-              
-              // 사용 횟수 체크 (구독이 없고 쿠폰 무료 시간도 없는 경우만)
-              if (!subscription && !hasCouponFreeTime) {
-                // 사용 횟수 데이터가 로드되지 않았으면 대기
-                if (usageCheckQuery.isLoading) {
-                  toast.info("사용 횟수를 확인 중입니다. 잠시 후 다시 시도해주세요.");
-                  return;
-                }
-                if (usageCheckQuery.data) {
-                  const { shouldPrompt, reason, voiceCount } = usageCheckQuery.data;
-                  // 음성 모드일 때: 음성 사용 횟수 체크 (1회 무료)
-                  if (voiceMode && voiceCount >= 1) {
-                    setUsageLimitReason("voice_limit");
-                    setShowUsageLimitModal(true);
-                    return;
-                  }
-                  // 텍스트 모드일 때: 일반 사용 횟수 체크
-                  if (!voiceMode && reason === "usage_limit" && shouldPrompt) {
-                    setUsageLimitReason("usage_limit");
-                    setShowUsageLimitModal(true);
-                    return;
-                  }
-                }
-              }
-              
-              // 사용 횟수 증가
-              incrementUsageMutation.mutate({
-                sessionId: sessionTrackingId,
-                featureType: voiceMode ? "voice_interview" : "text_interview",
-              });
-              
-              // 선택된 질문 상태 업데이트 및 면접 시작
-              setSelectedQuestions(questions);
-              setPlanMode("structured");
-              setTotalQuestions(5);
-              setStatus("starting");
-              startMutation.mutate({
-                sessionType: "mock_interview",
-                totalQuestions: 5,
-                isVoiceMode: voiceMode,
-                selectedQuestions: questions,
-                planMode: "structured",
-              });
-              toast.success(`사전 질문 ${questions.length}개를 포함한 구조화 면접을 시작합니다!`);
-            }}
-          />
-          
-          {/* 선택된 질문 표시 - 드래그 앤 드롭으로 순서 변경 가능 */}
-          {selectedQuestions.length > 0 && (
-            <div className="w-full p-4 bg-primary/5 rounded-lg border border-primary/20">
-              <div className="flex items-center justify-between mb-3">
-                <div>
-                  <p className="font-medium text-sm text-primary">선택된 질문 ({selectedQuestions.length}개)</p>
-                  <p className="text-xs text-muted-foreground mt-0.5">드래그하여 순서를 변경할 수 있습니다</p>
-                </div>
-                <div className="flex items-center gap-2">
-                  <Button 
-                    variant="outline" 
-                    size="sm" 
-                    onClick={() => {
-                      console.log('공유 버튼 클릭 - selectedQuestions:', selectedQuestions);
-                      if (selectedQuestions.length === 0) {
-                        toast.error('공유할 질문을 선택해주세요');
-                        return;
-                      }
-                      console.log('mutation 호출 시작');
-                      shareQuestionsMutation.mutate({
-                        title: `${profile?.targetCompany || '미지정'} ${profile?.targetPosition || ''} 면접 질문`,
-                        questions: selectedQuestions,
-                        targetCompany: profile?.targetCompany || undefined,
-                        targetPosition: profile?.targetPosition || undefined,
-                      });
-                    }} 
-                    className="text-xs h-7 gap-1"
-                  >
-                    <Share2 className="w-3 h-3" />
-                    공유
-                  </Button>
-                  <Button variant="ghost" size="sm" onClick={() => setSelectedQuestions([])} className="text-xs h-7">
-                    전체 해제
-                  </Button>
-                </div>
-                {/* 인라인 공유 링크 표시 */}
-                {generatedShareUrl && (
-                  <div className="mt-2 p-3 bg-green-50 border border-green-200 rounded-lg">
-                    <div className="flex items-center gap-2 mb-2">
-                      <CheckCircle2 className="w-4 h-4 text-green-600" />
-                      <span className="text-sm font-medium text-green-800">공유 링크가 생성되었습니다!</span>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <input 
-                        type="text" 
-                        value={generatedShareUrl} 
-                        readOnly 
-                        className="flex-1 text-xs p-2 bg-white border rounded text-gray-700"
-                      />
-                      <Button 
-                        size="sm" 
-                        variant="outline"
-                        className="h-8 text-xs"
-                        onClick={() => {
-                          navigator.clipboard.writeText(generatedShareUrl);
-                          toast.success('링크가 클립보드에 복사되었습니다!');
-                        }}
-                      >
-                        <Copy className="w-3 h-3 mr-1" />
-                        복사
-                      </Button>
-                      <Button 
-                        size="sm" 
-                        variant="ghost"
-                        className="h-8 text-xs"
-                        onClick={() => setGeneratedShareUrl(null)}
-                      >
-                        닫기
-                      </Button>
-                    </div>
-                  </div>
-                )}
-              </div>
-              <DndContext
-                sensors={sensors}
-                collisionDetection={closestCenter}
-                onDragEnd={handleDragEnd}
-              >
-                <SortableContext
-                  items={selectedQuestions}
-                  strategy={verticalListSortingStrategy}
-                >
-                  <div className="space-y-2 max-h-[300px] overflow-y-auto">
-                    {selectedQuestions.map((question, idx) => (
-                      <SortableQuestionItem
-                        key={question}
-                        id={question}
-                        question={question}
-                        index={idx}
-                        onRemove={() => {
-                          setSelectedQuestions(prev => prev.filter((_, i) => i !== idx));
-                          toast.success("질문이 제거되었습니다");
-                        }}
-                      />
-                    ))}
-                  </div>
-                </SortableContext>
-              </DndContext>
-            </div>
-          )}
-
-          {/* 면접관 아바타 선택 */}
-          <div className="flex justify-center mb-4">
-            <AvatarSelector
-              selectedAvatarId={selectedAvatar.id}
-              onSelect={(avatar) => {
-                setSelectedAvatar(avatar);
-                setTtsVoiceType(avatar.voiceType);
-                toast.success(`${avatar.name} 면접관이 선택되었습니다`);
-              }}
-              disabled={status !== 'idle'}
-            />
-          </div>
-
-          {/* Chrome 브라우저 권장 배너 */}
-          {voiceMode && showBrowserWarning && !isChromeBrowser && (
-            <div className="w-full max-w-md mb-4 p-3 bg-amber-50 border border-amber-200 rounded-lg">
-              <div className="flex items-start gap-2">
-                <AlertCircle className="w-5 h-5 text-amber-600 flex-shrink-0 mt-0.5" />
-                <div className="flex-1">
-                  <p className="text-sm font-medium text-amber-800">Chrome 브라우저 권장</p>
-                  <p className="text-xs text-amber-700 mt-1">
-                    음성 인식 기능은 Chrome 브라우저에서 가장 안정적으로 작동합니다.
-                  </p>
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    className="mt-2 h-7 text-xs text-amber-700 hover:text-amber-800 p-0"
-                    onClick={() => setShowBrowserWarning(false)}
-                  >
-                    닫기
-                  </Button>
-                </div>
-              </div>
-            </div>
-          )}
-
-          {/* 마이크 권한 거부 시 안내 배너 */}
-          {voiceMode && micPermissionDenied && (
-            <div className="w-full max-w-md mb-4 p-3 bg-red-50 border border-red-200 rounded-lg">
-              <div className="flex items-start gap-2">
-                <AlertCircle className="w-5 h-5 text-red-600 flex-shrink-0 mt-0.5" />
-                <div className="flex-1">
-                  <p className="text-sm font-medium text-red-800">마이크 권한이 거부되었습니다</p>
-                  <p className="text-xs text-red-700 mt-1">
-                    음성 면접을 위해 브라우저 설정에서 마이크 권한을 허용해주세요.
-                  </p>
-                  <div className="flex gap-2 mt-2">
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      className="h-7 text-xs"
-                      onClick={() => setShowMicPermissionGuide(true)}
-                    >
-                      권한 허용 방법
-                    </Button>
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      className="h-7 text-xs"
-                      onClick={() => {
-                        setVoiceMode(false);
-                        setMicPermissionDenied(false);
-                        toast.info('텍스트 모드로 전환되었습니다');
-                      }}
-                    >
-                      텍스트 모드로 전환
-                    </Button>
-                  </div>
-                </div>
-              </div>
-            </div>
-          )}
-
-          <div className="flex flex-col items-center gap-4 pb-6">
-            {voiceMode ? (
-              <>
-                <div className="text-center p-4 bg-gradient-to-r from-gold/10 to-orange-100 rounded-xl border border-gold/30 w-full max-w-md">
-                  <Mic className="w-8 h-8 text-gold mx-auto mb-2 animate-pulse" />
-                  <p className="font-medium text-gold">음성 면접 모드 선택됨</p>
-                  <p className="text-sm text-muted-foreground mt-1">마이크를 사용하여 음성으로 답변합니다</p>
-                  
-                  {/* 마이크 테스트 상태 표시 */}
-                  {micTestPassed ? (
-                    <div className="mt-3 flex items-center justify-center gap-2 text-green-600">
-                      <CheckCircle2 className="w-5 h-5" />
-                      <span className="text-sm font-medium">마이크 테스트 완료!</span>
-                    </div>
-                  ) : (
-                    <div className="mt-3 space-y-2">
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        className="gap-2 border-gold text-gold hover:bg-gold/10"
-                        onClick={() => {
-                          setShowMicTest(true);
-                          setMicTestStatus('idle');
-                        }}
-                      >
-                        <Mic className="w-4 h-4" />
-                        마이크 테스트하기 (권장)
-                      </Button>
-                      <p className="text-xs text-muted-foreground">
-                        테스트 없이도 시작 가능합니다
-                      </p>
-                    </div>
-                  )}
-                </div>
-                <Button 
-                  size="lg" 
-                  className="gap-2 px-8 w-full sm:w-auto bg-gradient-to-r from-gold to-orange-500 hover:from-gold/90 hover:to-orange-500/90 text-white shadow-lg"
-                  onClick={handleStart}
-                  disabled={!profile?.targetCompany || !profile?.targetPosition}
-                >
-                  <Mic className="w-5 h-5" />
-                  음성 면접 시작하기
-                </Button>
-              </>
-            ) : (
-              <Button 
-                size="lg" 
-                className="gap-2 px-8 w-full sm:w-auto"
-                onClick={handleStart}
-                disabled={!profile?.targetCompany || !profile?.targetPosition}
-              >
-                <Sparkles className="w-4 h-4" />
-                텍스트 면접 시작하기
-              </Button>
-            )}
-            
-            {/* 쿠폰 입력 버튼 */}
-            <div className="mt-4 pt-4 border-t border-border/50">
-              <CouponInputModal variant="compact" />
-            </div>
-          </div>
-        </div>
-
-        {/* 마이크 테스트 다이얼로그 - idle 화면에서도 표시 */}
-        <Dialog open={showMicTest} onOpenChange={setShowMicTest}>
-          <DialogContent className="sm:max-w-md">
-            <DialogHeader>
-              <DialogTitle className="flex items-center gap-2">
-                🎤 마이크 테스트
-              </DialogTitle>
-              <DialogDescription>
-                음성 면접을 위해 마이크가 정상적으로 작동하는지 확인합니다.
-              </DialogDescription>
-            </DialogHeader>
-            
-            <div className="space-y-4 py-4">
-              {/* 마이크 상태 표시 */}
-              <div className="flex flex-col items-center gap-4">
-                <div className={`w-24 h-24 rounded-full flex items-center justify-center transition-all ${
-                  micTestStatus === 'idle' ? 'bg-gray-100' :
-                  micTestStatus === 'testing' ? 'bg-gold/20 animate-pulse' :
-                  micTestStatus === 'success' ? 'bg-green-100' :
-                  'bg-red-100'
-                }`}>
-                  <Mic className={`w-12 h-12 ${
-                    micTestStatus === 'idle' ? 'text-gray-400' :
-                    micTestStatus === 'testing' ? 'text-gold' :
-                    micTestStatus === 'success' ? 'text-green-600' :
-                    'text-red-600'
-                  }`} />
-                </div>
-                
-                {/* 볼륨 바 */}
-                {micTestStatus === 'testing' && (
-                  <div className="w-full h-4 bg-gray-200 rounded-full overflow-hidden">
-                    <div 
-                      className="h-full bg-gradient-to-r from-gold to-orange-500 transition-all duration-100"
-                      style={{ width: `${Math.min(micTestVolume * 100, 100)}%` }}
-                    />
-                  </div>
-                )}
-                
-                <p className="text-center text-sm">
-                  {micTestStatus === 'idle' && '아래 버튼을 눌러 마이크를 테스트하세요'}
-                  {micTestStatus === 'testing' && '말씀해보세요... "안녕하세요, 면접 준비가 되었습니다"'}
-                  {micTestStatus === 'success' && <span className="text-green-600 font-medium">✅ 마이크가 정상적으로 작동합니다!</span>}
-                  {micTestStatus === 'failed' && <span className="text-red-600">❌ 마이크를 찾을 수 없습니다. 권한을 확인해주세요.</span>}
-                </p>
-              </div>
-            </div>
-            
-            <div className="flex flex-col gap-2">
-              {micTestStatus === 'idle' && (
-                <Button
-                  onClick={async () => {
-                    setMicTestStatus('testing');
-                    setMicTestVolume(0);
-                    try {
-                      // 마이크 권한 요청
-                      const stream = await navigator.mediaDevices.getUserMedia({ 
-                        audio: {
-                          echoCancellation: true,
-                          noiseSuppression: true,
-                          autoGainControl: true
-                        } 
-                      });
-                      
-                      // AudioContext 생성 및 resume (브라우저 정책 대응)
-                      const audioContext = new (window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext)();
-                      
-                      // AudioContext가 suspended 상태일 수 있으므로 resume 호출
-                      if (audioContext.state === 'suspended') {
-                        await audioContext.resume();
-                      }
-                      
-                      const analyser = audioContext.createAnalyser();
-                      const microphone = audioContext.createMediaStreamSource(stream);
-                      microphone.connect(analyser);
-                      analyser.fftSize = 256;
-                      analyser.smoothingTimeConstant = 0.3;
-                      const dataArray = new Uint8Array(analyser.frequencyBinCount);
-                      
-                      let maxVolume = 0;
-                      let volumeSum = 0;
-                      let volumeCount = 0;
-                      
-                      const checkVolume = setInterval(() => {
-                        analyser.getByteFrequencyData(dataArray);
-                        const average = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
-                        const volume = Math.min(average / 128, 1);
-                        setMicTestVolume(volume);
-                        volumeSum += volume;
-                        volumeCount++;
-                        if (volume > maxVolume) maxVolume = volume;
-                      }, 100);
-                      
-                      setTimeout(() => {
-                        clearInterval(checkVolume);
-                        stream.getTracks().forEach(track => track.stop());
-                        audioContext.close();
-                        
-                        const avgVolume = volumeCount > 0 ? volumeSum / volumeCount : 0;
-                        console.log('Mic test result - max:', maxVolume, 'avg:', avgVolume);
-                        
-                        // 최대 볼륨이 0.05 이상이거나 평균 볼륨이 0.02 이상이면 성공
-                        if (maxVolume > 0.05 || avgVolume > 0.02) {
-                          setMicTestStatus('success');
-                          setMicTestPassed(true);
-                        } else {
-                          setMicTestStatus('failed');
-                          toast.error('마이크에서 음성이 감지되지 않았습니다. 마이크를 확인해주세요.');
-                        }
-                      }, 3000);
-                    } catch (error: unknown) {
-                      console.error('Microphone access error:', error);
-                      setMicTestStatus('failed');
-                      
-                      // 에러 유형별 메시지
-                      if (error instanceof Error) {
-                        if (error.name === 'NotAllowedError' || error.name === 'PermissionDeniedError') {
-                          setMicPermissionDenied(true);
-                          setShowMicTest(false);
-                          toast.error('마이크 권한이 거부되었습니다. 권한 허용 방법을 확인하거나 텍스트 모드로 전환하세요.');
-                        } else if (error.name === 'NotFoundError' || error.name === 'DevicesNotFoundError') {
-                          toast.error('마이크를 찾을 수 없습니다. 마이크가 연결되어 있는지 확인해주세요.');
-                        } else {
-                          toast.error('마이크 접근 중 오류가 발생했습니다: ' + error.message);
-                        }
-                      } else {
-                        toast.error('마이크 접근 중 오류가 발생했습니다.');
-                      }
-                    }
-                  }}
-                  className="w-full bg-gradient-to-r from-gold to-orange-500 hover:from-gold/90 hover:to-orange-500/90"
-                >
-                  <Mic className="w-4 h-4 mr-2" />
-                  마이크 테스트 시작
-                </Button>
-              )}
-              
-              {micTestStatus === 'testing' && (
-                <Button disabled className="w-full">
-                  <Loader2 className="w-4 h-4 mr-2 animate-spin" />
-                  테스트 중... (3초)
-                </Button>
-              )}
-              
-              {micTestStatus === 'success' && (
-                <Button
-                  onClick={() => {
-                    setShowMicTest(false);
-                    toast.success('마이크 테스트 완료! 음성 면접을 시작할 수 있습니다.');
-                  }}
-                  className="w-full bg-green-600 hover:bg-green-700"
-                >
-                  <CheckCircle2 className="w-4 h-4 mr-2" />
-                  확인 및 닫기
-                </Button>
-              )}
-              
-              {micTestStatus === 'failed' && (
-                <>
-                  <Button
-                    onClick={() => setMicTestStatus('idle')}
-                    className="w-full"
-                  >
-                    다시 시도
-                  </Button>
-                  <Button
-                    variant="outline"
-                    onClick={() => {
-                      setShowMicTest(false);
-                      setMicTestPassed(true);
-                      toast.info('마이크 테스트를 건너뛰었습니다. 음성 인식이 잘 되지 않을 수 있습니다.');
-                    }}
-                    className="w-full"
-                  >
-                    건너뛰고 계속하기
-                  </Button>
-                </>
-              )}
-              
-              <Button
-                variant="ghost"
-                onClick={() => setShowMicTest(false)}
-                className="w-full text-muted-foreground"
-              >
-                취소
-              </Button>
-            </div>
-          </DialogContent>
-        </Dialog>
-
-        {/* 마이크 권한 안내 팝업 */}
-        <Dialog open={showMicPermissionGuide} onOpenChange={setShowMicPermissionGuide}>
-          <DialogContent className="max-w-md">
-            <DialogHeader>
-              <DialogTitle className="flex items-center gap-2">
-                <Mic className="w-5 h-5 text-gold" />
-                마이크 권한 허용 방법
-              </DialogTitle>
-              <DialogDescription>
-                음성 면접을 위해 마이크 권한이 필요합니다
-              </DialogDescription>
-            </DialogHeader>
-            <div className="space-y-4">
-              <div className="bg-muted/50 p-4 rounded-lg space-y-3">
-                <h4 className="font-medium text-sm">Chrome 브라우저</h4>
-                <ol className="text-sm text-muted-foreground space-y-2 list-decimal list-inside">
-                  <li>주소창 왼쪽의 자물쇠 아이콘을 클릭하세요</li>
-                  <li>'사이트 설정' 또는 '권한'을 클릭하세요</li>
-                  <li>'마이크' 항목을 '허용'으로 변경하세요</li>
-                  <li>페이지를 새로고침하세요</li>
-                </ol>
-              </div>
-              <div className="bg-muted/50 p-4 rounded-lg space-y-3">
-                <h4 className="font-medium text-sm">Safari 브라우저 (iOS/Mac)</h4>
-                <ol className="text-sm text-muted-foreground space-y-2 list-decimal list-inside">
-                  <li>설정 &gt; Safari &gt; 웹사이트 설정으로 이동하세요</li>
-                  <li>해당 웹사이트를 찾아 마이크를 허용하세요</li>
-                </ol>
-              </div>
-              <div className="flex gap-2">
-                <Button
-                  className="flex-1"
-                  onClick={() => {
-                    setShowMicPermissionGuide(false);
-                    window.location.reload();
-                  }}
-                >
-                  페이지 새로고침
-                </Button>
-                <Button
-                  variant="outline"
-                  className="flex-1"
-                  onClick={() => {
-                    setShowMicPermissionGuide(false);
-                    setVoiceMode(false);
-                    setMicPermissionDenied(false);
-                    toast.info('텍스트 모드로 전환되었습니다');
-                  }}
-                >
-                  텍스트 모드로 전환
-                </Button>
-              </div>
-            </div>
-          </DialogContent>
-        </Dialog>
-        
-
-      </DashboardLayout>
-    );
   }
 
   // 질문 생성이 지연되거나 실패했을 때는 무한 로딩 대신 사용자가 다음 행동을 선택합니다.
-  if (questionGenerationError && !currentQA) {
+  if (questionGenerationError) {
     return (
       <DashboardLayout>
         <div className="mx-auto flex min-h-[400px] max-w-lg flex-col items-center justify-center px-4 text-center">
@@ -3616,51 +2680,112 @@ export default function Interview() {
 
   // 면접 진행 화면 (answering, feedback)
   return (
-    <DashboardLayout>
-      <div className="max-w-3xl mx-auto space-y-6 px-4 sm:px-0">
+    <DashboardLayout immersive={voiceMode}>
+      <div className={voiceMode ? "mx-auto min-h-dvh max-w-6xl space-y-4 px-3 py-3 sm:px-6 sm:py-5" : "mx-auto max-w-3xl space-y-6 px-4 sm:px-0"}>
         {/* 홈 버튼 및 Progress */}
         <div className="flex items-center justify-between">
           <Button 
             variant="ghost" 
             size="sm" 
-            className="gap-1 text-muted-foreground hover:text-foreground"
+            className={voiceMode ? "min-h-11 gap-1 text-slate-300 hover:bg-white/10 hover:text-white" : "gap-1 text-muted-foreground hover:text-foreground"}
             onClick={() => setShowQuitConfirmDialog(true)}
           >
             <Home className="w-4 h-4" />
             <span className="hidden sm:inline">면접 종료</span>
           </Button>
-          <div className="text-xs text-muted-foreground">
-            ℹ️ 지금 종료하면 답변한 질문만 차감됩니다
+          <div className={voiceMode ? "text-xs text-slate-400" : "text-xs text-muted-foreground"}>
+            답변 완료 {qas.filter(item => item.questionType !== "follow_up").length}개
           </div>
         </div>
         <div className="flex items-center justify-between">
-          <p className="text-sm text-muted-foreground">
+          <p className={voiceMode ? "text-sm text-slate-300" : "text-sm text-muted-foreground"}>
             질문 {questionIndex + 1} / {totalQuestions}
           </p>
-          <div className="flex gap-1">
+          <div className="flex gap-1" aria-label={`전체 ${totalQuestions}문항 중 ${questionIndex + 1}번째`}>
             {Array.from({ length: totalQuestions }).map((_, i) => (
               <div
                 key={i}
-                className={`w-6 sm:w-8 h-2 rounded-full ${
+                className={`h-2 w-6 rounded-full sm:w-8 ${
                   i < questionIndex ? "bg-green-500" 
-                  : i === questionIndex ? "bg-primary" 
-                  : "bg-secondary"
+                  : i === questionIndex ? (voiceMode ? "bg-cyan-400" : "bg-primary")
+                  : (voiceMode ? "bg-slate-700" : "bg-secondary")
                 }`}
               />
             ))}
           </div>
         </div>
 
-        {/* 면접관 아바타 표시 */}
-        <InterviewingAvatar
-          avatar={selectedAvatar}
-          isSpeaking={isSpeaking}
-          emotion={avatarEmotion}
-          message={isSpeaking ? "질문을 읽고 있습니다..." : status === 'feedback' ? "답변을 분석하고 있습니다..." : undefined}
-        />
+        {voiceMode ? (
+          <section className="relative min-h-[52vh] overflow-hidden rounded-3xl border border-white/10 bg-[radial-gradient(circle_at_top,_#164e63_0%,_#0f172a_45%,_#020617_100%)] shadow-2xl" aria-label="실전 화상 면접실">
+            <div className="flex min-h-[52vh] items-center justify-center px-4 pb-40 pt-14 sm:pb-36">
+              <div className="[&_.text-foreground]:text-white [&_.text-muted-foreground]:text-slate-300">
+                <InterviewingAvatar
+                  avatar={selectedAvatar}
+                  isSpeaking={isSpeaking}
+                  emotion={avatarEmotion}
+                  message={isSpeaking || isTTSLoading ? "질문 중" : status === "feedback" ? "답변 확인 중" : "지원자 답변 대기"}
+                />
+              </div>
+            </div>
 
-        {/* Question Card */}
-        <Card>
+            {cameraEnabled && (
+              <div className="absolute right-3 top-3 z-10 w-24 sm:w-36">
+                <InterviewMediaCheck audio={false} video autoStart selfView />
+              </div>
+            )}
+
+            <div className="absolute left-3 top-3 z-10 flex min-h-11 items-center rounded-full border border-white/10 bg-black/45 px-3 text-xs font-medium text-white backdrop-blur">
+              {isSpeaking || isTTSLoading
+                ? "면접관 질문 중"
+                : isRecording || isListening
+                  ? "답변 녹음 중"
+                  : isTranscribing || submitMutation.isPending
+                    ? "답변 분석 중"
+                    : status === "feedback"
+                      ? "즉시 교정 완료"
+                      : "답변 준비"}
+            </div>
+
+            <div className="absolute inset-x-0 bottom-0 border-t border-white/10 bg-slate-950/85 p-4 text-white backdrop-blur-md sm:p-5">
+              <div className="flex flex-wrap items-center gap-2 text-xs text-cyan-200">
+                <span>{getQuestionTypeLabel(currentQA?.questionType || "")}</span>
+                {currentQA?.phaseLabel && <span aria-hidden="true">·</span>}
+                {currentQA?.phaseLabel && <span>{currentQA.phaseLabel}</span>}
+                {timerEnabled && (timerActive || timerOvertime) && (
+                  <span className={timerOvertime || timeRemaining <= 30 ? "ml-auto font-mono font-bold text-amber-300" : "ml-auto font-mono font-bold text-white"} aria-live="polite">
+                    {timerOvertime ? `+${Math.floor(overtimeSeconds / 60)}:${(overtimeSeconds % 60).toString().padStart(2, "0")}` : `${Math.floor(timeRemaining / 60)}:${(timeRemaining % 60).toString().padStart(2, "0")}`}
+                  </span>
+                )}
+              </div>
+              <h1 className="mt-2 max-w-4xl text-lg font-semibold leading-relaxed sm:text-2xl" aria-live="polite">{currentQA?.question}</h1>
+              <div className="mt-3 flex items-center gap-2">
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className="min-h-11 border-white/20 bg-white/5 text-white hover:bg-white/10 hover:text-white"
+                  onClick={() => isSpeaking ? stopSpeaking() : void speakQuestion(currentQA?.question || "")}
+                  disabled={isTTSLoading || isRecording || isListening}
+                >
+                  {isSpeaking ? <VolumeX className="mr-2 h-4 w-4" /> : <Volume2 className="mr-2 h-4 w-4" />}
+                  {isSpeaking ? "질문 음성 중지" : "질문 다시 듣기"}
+                </Button>
+                {ttsProviderStatus !== "idle" && <span className="text-xs text-slate-400" aria-live="polite">{ttsProviderStatus === "loading" ? "음성 준비 중" : ttsProviderStatus === "supertonic2" ? "면접관 음성" : "화면 질문"}</span>}
+              </div>
+            </div>
+          </section>
+        ) : (
+          <>
+            {/* 면접관 아바타 표시 */}
+            <InterviewingAvatar
+              avatar={selectedAvatar}
+              isSpeaking={isSpeaking}
+              emotion={avatarEmotion}
+              message={isSpeaking ? "질문을 읽고 있습니다..." : status === 'feedback' ? "답변을 분석하고 있습니다..." : undefined}
+            />
+
+            {/* Question Card */}
+            <Card>
           <CardHeader className="pb-3">
             {/* 모바일 반응형 레이아웃 */}
             <div className="flex flex-col gap-3">
@@ -3873,15 +2998,13 @@ export default function Interview() {
               </div>
             )}
           </CardHeader>
-        </Card>
-
-        {(status === "answering" || status === "feedback") && voiceMode && cameraEnabled && (
-          <InterviewMediaCheck audio={false} video autoStart compact />
+            </Card>
+          </>
         )}
 
         {/* Answer Input or Feedback */}
         {status === "answering" && (
-          <Card>
+          <Card className={voiceMode ? "border-white/10 bg-slate-900 text-white" : undefined}>
             <CardHeader>
               <CardTitle className="text-base flex items-center gap-2">
                 {voiceMode ? (
@@ -3903,15 +3026,19 @@ export default function Interview() {
             <CardContent className="space-y-4">
               {/* 음성 모드일 때 음성 입력 UI - 모바일 최적화 */}
               {voiceMode && (
-                <div className="flex flex-col items-center gap-3 p-4 sm:p-6 bg-gradient-to-r from-gold/5 to-orange-50 rounded-xl border border-gold/20">
+                <div className="flex flex-col items-center gap-3 rounded-xl border border-white/10 bg-slate-950/60 p-4 sm:p-6">
                   <div className="flex flex-col items-center gap-3">
                     {/* 통합 마이크 버튼 (음성 인식 + 녹음 동시 시작) - 모바일에서 더 크게 */}
                     <button
+                      type="button"
+                      aria-label={isListening || isRecording ? "음성 답변 녹음 종료" : "음성 답변 녹음 시작"}
+                      aria-pressed={isListening || isRecording}
+                      disabled={isSpeaking || isTTSLoading || isTranscribing}
                       onClick={async () => {
                         // Whisper API 사용 시 toggleListening만 호출 (녹음 + 변환 통합)
                         await toggleListening();
                       }}
-                      className={`w-28 h-28 sm:w-24 sm:h-24 rounded-full flex flex-col items-center justify-center transition-all shadow-lg ${
+                      className={`flex h-28 w-28 flex-col items-center justify-center rounded-full shadow-lg transition-all disabled:cursor-not-allowed disabled:opacity-50 sm:h-24 sm:w-24 ${
                         isListening || isRecording
                           ? 'bg-red-500 hover:bg-red-600 animate-pulse' 
                           : 'bg-gradient-to-r from-gold to-orange-500 hover:from-gold/90 hover:to-orange-500/90'
@@ -4027,7 +3154,7 @@ export default function Interview() {
               )}
 
               {/* 답변 길이 가이드 */}
-              {answer.length > 0 && (
+              {!voiceMode && answer.length > 0 && (
                 <div className="mb-2 p-3 rounded-lg border" style={{
                   backgroundColor: answer.length < 50 ? '#fef3c7' : answer.length < 300 ? '#d1fae5' : '#fed7aa',
                   borderColor: answer.length < 50 ? '#fbbf24' : answer.length < 300 ? '#10b981' : '#f97316'
@@ -4058,15 +3185,22 @@ export default function Interview() {
                 </div>
               )}
               
-              <Textarea
-                placeholder={voiceMode ? "음성으로 입력된 내용이 여기에 표시됩니다. 직접 수정도 가능합니다." : "답변을 입력하세요..."}
-                rows={8}
-                value={answer}
-                onChange={(e) => setAnswer(e.target.value)}
-              />
+              {(!voiceMode || Boolean(answer) || Boolean(recordedAudioUrl) || isTranscribing) && (
+                <Textarea
+                  aria-label="면접 답변"
+                  placeholder={voiceMode ? "음성으로 옮긴 답변을 확인하고 필요한 부분만 수정하세요." : "답변을 입력하세요..."}
+                  rows={voiceMode ? 5 : 8}
+                  value={answer}
+                  className={voiceMode ? "border-white/15 bg-slate-950/70 text-white placeholder:text-slate-500" : undefined}
+                  onChange={(e) => {
+                    if (!answerStartTime && e.target.value.trim()) setAnswerStartTime(Date.now());
+                    setAnswer(e.target.value);
+                  }}
+                />
+              )}
               
               {/* 이력서/자소서 맞춤 안내 */}
-              {(!profile?.resume && !profile?.coverLetter) ? (
+              {!voiceMode && ((!profile?.resume && !profile?.coverLetter) ? (
                 <div className="p-4 bg-gradient-to-r from-indigo-50 to-purple-50 border border-indigo-200 rounded-lg">
                   <div className="flex items-start gap-3">
                     <div className="w-10 h-10 rounded-full bg-indigo-100 flex items-center justify-center shrink-0">
@@ -4097,15 +3231,15 @@ export default function Interview() {
                     </p>
                   </div>
                 </div>
-              )}
+              ))}
               
               {/* 개인정보 보호 안내 */}
-              <div className="flex items-start gap-2 p-3 bg-blue-50 border border-blue-200 rounded-lg">
+              {!voiceMode && <div className="flex items-start gap-2 p-3 bg-blue-50 border border-blue-200 rounded-lg">
                 <Shield className="w-4 h-4 text-blue-500 mt-0.5 shrink-0" />
                 <p className="text-xs text-blue-700">
                   <span className="font-medium">데이터 처리 안내:</span> 음성은 텍스트 변환을 위해 연결된 AI 서비스에서 처리되며, 앱에는 변환된 답변과 피드백이 저장됩니다. 주민등록번호·계좌번호 등 불필요한 민감정보는 입력하지 마세요.
                 </p>
-              </div>
+              </div>}
               
               <div className="flex flex-col sm:flex-row gap-3 justify-between items-center">
                 {voiceMode && (
@@ -4130,16 +3264,8 @@ export default function Interview() {
                     </>
                   )}
                   <Button 
-                    onClick={() => {
-                      if (voiceMode && answer.trim()) {
-                        // 음성 모드에서도 다음 질문으로 바로 이동하지 않고 피드백 요청을 먼저 확인합니다.
-                        setShowVoiceConfirmDialog(true);
-                        setVoiceConfirmType('next');
-                      } else {
-                        handleSubmitAnswer();
-                      }
-                    }}
-                    disabled={submitMutation.isPending || isTranscribing || !answer.trim()}
+                    onClick={handleSubmitAnswer}
+                    disabled={submitMutation.isPending || isTranscribing || isSpeaking || isRecording || isListening || !answer.trim()}
                     className={`gap-2 flex-1 sm:flex-none ${voiceMode ? 'bg-gradient-to-r from-gold to-orange-500 hover:from-gold/90 hover:to-orange-500/90' : ''}`}
                   >
                     {submitMutation.isPending ? (
@@ -4150,7 +3276,7 @@ export default function Interview() {
                     ) : (
                       <>
                         <Send className="w-4 h-4" />
-                        피드백 받기
+                        {voiceMode ? "답변 분석하고 바로 교정받기" : "피드백 받기"}
                       </>
                     )}
                   </Button>
@@ -4182,7 +3308,67 @@ export default function Interview() {
           </Card>
         )}
 
-        {status === "feedback" && currentQA && (
+        {status === "feedback" && currentQA && voiceMode && (
+          <section className="space-y-4 rounded-2xl border border-white/10 bg-slate-900 p-4 text-white sm:p-6" aria-labelledby="voice-correction-title">
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <p className="text-xs font-semibold uppercase tracking-widest text-cyan-300">Answer coaching</p>
+                <h2 id="voice-correction-title" className="mt-1 text-xl font-bold">방금 답변을 바로 고쳤습니다</h2>
+                <p className="mt-1 text-sm text-slate-400">원문에 없던 경험이나 수치는 만들지 않고, 말의 구조와 표현만 정리합니다.</p>
+              </div>
+              <div className="rounded-xl border border-white/10 bg-slate-950/60 px-4 py-3 text-right">
+                {qaAnswerDurations[currentQA.id] !== undefined && <p className="text-xs text-slate-400">답변 {qaAnswerDurations[currentQA.id]}초</p>}
+                <p className="text-2xl font-bold text-cyan-300">{currentQA.score ?? 0}<span className="ml-1 text-xs font-normal text-slate-400">/ 100</span></p>
+              </div>
+            </div>
+
+            <div className="rounded-xl bg-white text-slate-950">
+              <InstantAnswerCorrection
+                question={currentQA.question}
+                originalAnswer={currentQA.userAnswer || ""}
+                correctedAnswer={currentQA.suggestedAnswer}
+                correctedAnswerShort={currentQA.suggestedAnswerShort}
+                correctedAnswerLong={currentQA.suggestedAnswerLong}
+                improvements={currentQA.improvements}
+              />
+            </div>
+
+            {currentQA.feedback && (
+              <details className="rounded-xl border border-white/10 bg-slate-950/40 p-4">
+                <summary className="min-h-11 cursor-pointer font-medium">상세 피드백 보기</summary>
+                <div className="mt-3 text-sm leading-6 text-slate-300"><Streamdown>{currentQA.feedback}</Streamdown></div>
+              </details>
+            )}
+
+            {currentQA.questionType !== "follow_up" && followUpCount === 0 && currentQA.followUpQuestions?.[0] && (
+              <div className="rounded-xl border border-amber-400/30 bg-amber-400/5 p-4">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div>
+                    <p className="font-semibold text-amber-200">면접관이 답변을 더 확인하려 합니다</p>
+                    <p className="mt-1 text-sm text-slate-400">꼬리질문은 이 면접에서 한 번만 진행되며 추가 크레딧을 사용하지 않습니다.</p>
+                  </div>
+                  <label className="flex items-center gap-2 text-xs text-slate-300" htmlFor="voice-follow-up-difficulty">
+                    난이도
+                    <select id="voice-follow-up-difficulty" value={followUpDifficulty} onChange={(event) => setFollowUpDifficulty(event.target.value as 'easy' | 'medium' | 'hard')} className="min-h-11 rounded-md border border-white/15 bg-slate-950 px-3 text-white">
+                      <option value="easy">쉬움</option>
+                      <option value="medium">보통</option>
+                      <option value="hard">어려움</option>
+                    </select>
+                  </label>
+                </div>
+                <Button type="button" variant="outline" className="mt-3 min-h-11 w-full border-amber-300/30 bg-transparent text-amber-100 hover:bg-amber-300/10 hover:text-white" onClick={handleStartFollowUp}>
+                  꼬리질문에 답하기
+                </Button>
+              </div>
+            )}
+
+            <Button onClick={handleNextQuestion} className="min-h-12 w-full gap-2" disabled={completeMutation.isPending || generateMutation.isPending}>
+              {generateMutation.isPending ? <><Loader2 className="h-4 w-4 animate-spin" /> 다음 질문 준비 중</> : completeMutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : questionIndex + 1 >= totalQuestions ? <>면접 완료 <CheckCircle2 className="h-4 w-4" /></> : <>다음 질문 <ArrowRight className="h-4 w-4" /></>}
+            </Button>
+          </section>
+        )}
+
+        {status === "feedback" && currentQA && !voiceMode && (
           <>
             <Card>
               <CardHeader>
@@ -4223,6 +3409,7 @@ export default function Interview() {
               </CardHeader>
               <CardContent className="space-y-4">
                 <InstantAnswerCorrection
+                  question={currentQA.question}
                   originalAnswer={currentQA.userAnswer || ""}
                   correctedAnswer={currentQA.suggestedAnswer}
                   correctedAnswerShort={currentQA.suggestedAnswerShort}
@@ -4431,180 +3618,30 @@ export default function Interview() {
                   </div>
                 )}
                 
-                {/* 추천 후속 질문 섹션 - AI 생성 후속 질문 사용 */}
-                {(currentQA.followUpQuestions && currentQA.followUpQuestions.length > 0) && (
-                  <div className="mt-4 pt-4 border-t border-border">
-                    <div className="flex items-center justify-between mb-3">
-                      <div className="flex items-center gap-2">
-                        <Sparkles className="w-4 h-4 text-amber-500" />
-                        <p className="text-sm font-medium text-amber-700">이런 후속 질문이 나올 수 있어요</p>
+                {currentQA.questionType !== "follow_up" && followUpCount === 0 && currentQA.followUpQuestions?.[0] && (
+                  <div className="mt-4 rounded-xl border border-amber-500/30 bg-amber-500/5 p-4">
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <div>
+                        <p className="flex items-center gap-2 text-sm font-semibold"><Zap className="h-4 w-4 text-amber-500" /> 실전 꼬리질문</p>
+                        <p className="mt-1 text-xs text-muted-foreground">현재 답변을 더 구체적으로 확인하는 질문을 한 번 이어서 받습니다.</p>
                       </div>
-                      <div className="flex items-center gap-2">
-                        <span className="text-xs text-muted-foreground">난이도:</span>
-                        <select
-                          value={followUpDifficulty}
-                          onChange={(e) => setFollowUpDifficulty(e.target.value as 'easy' | 'medium' | 'hard')}
-                          className="text-xs border rounded px-2 py-1 bg-background"
-                        >
+                      <label className="flex items-center gap-2 text-xs" htmlFor="follow-up-difficulty">
+                        난이도
+                        <select id="follow-up-difficulty" value={followUpDifficulty} onChange={(event) => setFollowUpDifficulty(event.target.value as 'easy' | 'medium' | 'hard')} className="min-h-11 rounded-md border bg-background px-3">
                           <option value="easy">쉬움</option>
                           <option value="medium">보통</option>
                           <option value="hard">어려움</option>
                         </select>
-                      </div>
+                      </label>
                     </div>
-                    
-                    {/* 꼬리 질문 연속 모드 토글 */}
-                    <div className="mb-3 p-3 bg-orange-50 rounded-lg border border-orange-200">
-                      <div className="flex items-center justify-between mb-2">
-                        <div className="flex items-center gap-2">
-                          <Zap className="w-4 h-4 text-orange-500" />
-                          <span className="text-sm font-medium text-orange-700">꼬리 질문 연속 모드</span>
-                          <span className="text-xs text-orange-500">(실전 압박 면접)</span>
-                        </div>
-                        <label className="relative inline-flex items-center cursor-pointer">
-                          <input
-                            type="checkbox"
-                            checked={continuousFollowUpMode}
-                            onChange={(e) => {
-                              setContinuousFollowUpMode(e.target.checked);
-                              if (!e.target.checked) {
-                                setFollowUpCount(0); // 모드 해제 시 카운트 초기화
-                              }
-                            }}
-                            className="sr-only peer"
-                          />
-                          <div className="w-9 h-5 bg-gray-200 peer-focus:outline-none peer-focus:ring-2 peer-focus:ring-orange-300 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-orange-500"></div>
-                        </label>
-                      </div>
-                      
-                      {continuousFollowUpMode && (
-                        <>
-                          {/* 진행 상황 표시 */}
-                          <div className="mb-2">
-                            <div className="flex items-center justify-between text-xs text-orange-600 mb-1">
-                              <span>진행 상황</span>
-                              <span>{followUpCount} / {maxFollowUpCount}회</span>
-                            </div>
-                            <div className="w-full bg-orange-200 rounded-full h-2">
-                              <div 
-                                className="bg-gradient-to-r from-orange-400 to-orange-600 h-2 rounded-full transition-all duration-300"
-                                style={{ width: `${(followUpCount / maxFollowUpCount) * 100}%` }}
-                              />
-                            </div>
-                          </div>
-                          
-                          {/* 최대 횟수 설정 */}
-                          <div className="flex items-center gap-2 mb-2">
-                            <span className="text-xs text-orange-600">최대 횟수:</span>
-                            <select
-                              value={maxFollowUpCount}
-                              onChange={(e) => setMaxFollowUpCount(Number(e.target.value))}
-                              className="text-xs border border-orange-300 rounded px-2 py-1 bg-white"
-                            >
-                              <option value={2}>2회</option>
-                              <option value={3}>3회</option>
-                              <option value={5}>5회</option>
-                              <option value={10}>10회</option>
-                            </select>
-                          </div>
-                          
-                          {/* 중지 버튼 */}
-                          {followUpCount > 0 && (
-                            <Button
-                              variant="outline"
-                              size="sm"
-                              onClick={() => {
-                                setContinuousFollowUpMode(false);
-                                setFollowUpCount(0);
-                                toast.info("꼬리 질문 연속 모드를 종료했습니다");
-                              }}
-                              className="w-full text-xs border-orange-300 text-orange-600 hover:bg-orange-100"
-                            >
-                              <StopCircle className="w-3 h-3 mr-1" />
-                              연속 모드 중지하기
-                            </Button>
-                          )}
-                          
-                          <p className="text-xs text-orange-500 mt-2">
-                            후속 질문에 답변하면 또 다른 후속 질문이 자동으로 이어집니다
-                          </p>
-                        </>
-                      )}
-                    </div>
-                    <div className="space-y-2">
-                      {currentQA.followUpQuestions.map((fq, idx) => {
-                        // 후속 질문별 예상 평가 포인트 생성
-                        const getEvaluationPoint = (question: string, index: number) => {
-                          const q = question.toLowerCase();
-                          if (q.includes('구체적') || q.includes('예시') || q.includes('사례')) {
-                            return '🎯 구체적 사례/수치 제시 능력 평가';
-                          }
-                          if (q.includes('어떻게') || q.includes('방법') || q.includes('과정')) {
-                            return '🛠️ 문제해결 과정/방법론 평가';
-                          }
-                          if (q.includes('왜') || q.includes('이유') || q.includes('동기')) {
-                            return '🧠 논리적 사고력/판단력 평가';
-                          }
-                          if (q.includes('결과') || q.includes('성과') || q.includes('효과')) {
-                            return '📊 성과 측정/자기 평가 능력';
-                          }
-                          if (q.includes('다시') || q.includes('다르게') || q.includes('개선')) {
-                            return '🔄 자기성찰/성장 가능성 평가';
-                          }
-                          if (q.includes('팀') || q.includes('협업') || q.includes('갈등')) {
-                            return '🤝 협업/소통 능력 평가';
-                          }
-                          const points = [
-                            '📝 답변 일관성/진정성 평가',
-                            '💡 문제 인식 능력 평가',
-                            '🎯 직무 이해도 평가'
-                          ];
-                          return points[index % points.length];
-                        };
-                        
-                        return (
-                          <div 
-                            key={idx}
-                            className="bg-amber-50 p-3 rounded-lg text-sm cursor-pointer hover:bg-amber-100 transition-colors border border-amber-200"
-                            onClick={() => {
-                              // 후속 질문으로 바로 면접 진행
-                              setCurrentQA({
-                                id: Date.now(),
-                                question: fq,
-                                questionType: 'follow_up',
-                              });
-                              setAnswer('');
-                              setStatus('answering');
-                              setQuestionIndex(prev => prev + 1);
-                              setTotalQuestions(prev => prev + 1);
-                              setFollowUpCount(prev => prev + 1); // 후속 질문 횟수 증가
-                              
-                              const difficultyLabel = followUpDifficulty === 'easy' ? '쉬움' : followUpDifficulty === 'hard' ? '어려움' : '보통';
-                              toast.success(`후속 질문으로 면접을 진행합니다 (난이도: ${difficultyLabel})`, {
-                                description: continuousFollowUpMode ? `연속 모드 ${followUpCount + 1}/${maxFollowUpCount}회` : "답변을 입력해주세요"
-                              });
-                              // 음성 모드일 때 TTS로 질문 읽어주기
-                              if (voiceMode && ttsEnabled) {
-                                setTimeout(() => {
-                                  speakQuestion(fq);
-                                }, 500);
-                              }
-                            }}
-                          >
-                            <div className="flex items-start gap-2">
-                              <span className="text-amber-700 font-medium">Q{idx + 1}.</span>
-                              <div className="flex-1">
-                                <span className="text-slate-900 font-medium">{fq}</span>
-                                <div className="mt-1 text-xs text-amber-700 flex items-center gap-1">
-                                  {getEvaluationPoint(fq, idx)}
-                                </div>
-                              </div>
-                            </div>
-                          </div>
-                        );
-                      })}
-                    </div>
-                    <p className="text-xs text-muted-foreground mt-2">클릭하면 해당 질문으로 바로 면접이 진행됩니다</p>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      className="mt-3 min-h-11 w-full"
+                      onClick={handleStartFollowUp}
+                    >
+                      면접관 꼬리질문 이어서 받기
+                    </Button>
                   </div>
                 )}
 
@@ -4710,55 +3747,6 @@ export default function Interview() {
           </>
         )}
       </div>
-
-      {/* 음성 면접 확인 다이얼로그 */}
-      <Dialog open={showVoiceConfirmDialog} onOpenChange={setShowVoiceConfirmDialog}>
-        <DialogContent className="sm:max-w-md">
-          <DialogHeader>
-            <DialogTitle className="flex items-center gap-2">
-              🎤 답변 확인
-            </DialogTitle>
-            <DialogDescription>
-              입력하신 답변을 제출하시겠습니까?
-            </DialogDescription>
-          </DialogHeader>
-          <div className="bg-slate-800 rounded-lg p-4 my-4 max-h-40 overflow-y-auto">
-            <p className="text-sm text-slate-200 whitespace-pre-wrap">
-              {answer || '입력된 답변이 없습니다.'}
-            </p>
-          </div>
-          <div className="flex flex-col gap-2">
-            <Button
-              onClick={() => {
-                setShowVoiceConfirmDialog(false);
-                handleSubmitAnswer();
-              }}
-              className="w-full bg-gradient-to-r from-gold to-orange-500 hover:from-gold/90 hover:to-orange-500/90"
-            >
-              ✅ 피드백 받기
-            </Button>
-            <Button
-              variant="outline"
-              onClick={() => {
-                setShowVoiceConfirmDialog(false);
-                setAnswer('');
-                setInterimTranscript('');
-                toast.info('다시 답변해주세요.');
-              }}
-              className="w-full"
-            >
-              🔄 다시 답변하기
-            </Button>
-            <Button
-              variant="ghost"
-              onClick={() => setShowVoiceConfirmDialog(false)}
-              className="w-full text-muted-foreground"
-            >
-              취소
-            </Button>
-          </div>
-        </DialogContent>
-      </Dialog>
 
       {/* 공유 모달 */}
       <ShareModal
@@ -5043,7 +4031,7 @@ export default function Interview() {
               ⚠️ 면접을 종료하시겠습니까?
             </DialogTitle>
             <DialogDescription>
-              지금까지 답변한 {questionIndex}개 질문만 차감되고, 남은 {totalQuestions - questionIndex}개 질문은 다음 면접에서 사용할 수 있습니다.
+              지금까지 답변한 {qas.filter(item => item.questionType !== "follow_up").length}개 기본 질문만 사용 처리되고, 결과는 서버에 안전하게 저장됩니다.
             </DialogDescription>
           </DialogHeader>
           <div className="bg-amber-50 border border-amber-200 rounded-lg p-4 my-4">
@@ -5052,9 +4040,9 @@ export default function Interview() {
               <div>
                 <p className="font-medium text-amber-800">진행 현황</p>
                 <ul className="text-sm text-amber-700 mt-1 space-y-1">
-                  <li>• 답변 완료: {questionIndex}개 질문</li>
-                  <li>• 남은 질문: {totalQuestions - questionIndex}개 (다음 면접에서 사용 가능)</li>
-                  <li>• 차감 횟수: {questionIndex}회</li>
+                  <li>• 답변 완료: {qas.filter(item => item.questionType !== "follow_up").length}개 질문</li>
+                  <li>• 남은 질문: {Math.max(0, totalQuestions - qas.filter(item => item.questionType !== "follow_up").length)}개</li>
+                  <li>• 꼬리질문: 추가 차감 없음</li>
                 </ul>
               </div>
             </div>
@@ -5064,12 +4052,11 @@ export default function Interview() {
               variant="destructive"
               onClick={() => {
                 setShowQuitConfirmDialog(false);
-                // 지금까지 답변한 내용으로 완료 처리
-                if (questionIndex > 0) {
-                  setStatus('completed');
-                  toast.success(`면접이 종료되었습니다. ${questionIndex}개 질문에 대한 피드백을 확인하세요.`);
+                const answeredBaseCount = qas.filter(item => item.questionType !== "follow_up").length;
+                if (answeredBaseCount > 0 && sessionId) {
+                  completeMutation.mutate({ sessionId });
                 } else {
-                  setLocation('/');
+                  setLocation('/dashboard');
                   toast.info('면접이 취소되었습니다. 횟수가 차감되지 않았습니다.');
                 }
               }}

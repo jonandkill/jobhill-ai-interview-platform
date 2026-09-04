@@ -16,6 +16,7 @@ interface InterviewMediaCheckProps {
   video?: boolean;
   autoStart?: boolean;
   compact?: boolean;
+  selfView?: boolean;
   onReadyChange?: (ready: boolean) => void;
 }
 
@@ -44,6 +45,7 @@ export default function InterviewMediaCheck({
   video = true,
   autoStart = false,
   compact = false,
+  selfView = false,
   onReadyChange,
 }: InterviewMediaCheckProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -239,6 +241,22 @@ export default function InterviewMediaCheck({
 
   const isBusy = state === "releasing" || state === "requesting";
   const busyLabel = state === "releasing" ? "장치 정리 중..." : "권한 확인 중...";
+
+  if (selfView) {
+    return (
+      <section className="relative aspect-[3/4] min-h-40 overflow-hidden rounded-xl border border-white/15 bg-slate-900 shadow-2xl" aria-label="내 카메라 화면" aria-busy={isBusy}>
+        <video ref={videoRef} muted playsInline className="h-full w-full scale-x-[-1] object-cover" aria-label="내 카메라 셀프뷰" />
+        <span className="absolute bottom-2 left-2 rounded-md bg-black/65 px-2 py-1 text-[11px] font-medium text-white">내 화면</span>
+        {state !== "ready" && (
+          <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 bg-slate-950/90 px-3 text-center text-xs text-slate-200">
+            {isBusy ? <Loader2 className="h-5 w-5 animate-spin motion-reduce:animate-none" /> : <Camera className="h-5 w-5" />}
+            <span>{state === "error" ? errorMessage : busyLabel}</span>
+            {state === "error" && <Button type="button" size="sm" variant="outline" className="min-h-11" onClick={() => void start()}>다시 연결</Button>}
+          </div>
+        )}
+      </section>
+    );
+  }
 
   return (
     <section className={`overflow-hidden rounded-xl border bg-card ${compact ? "p-3" : "p-4"}`} aria-label="카메라와 마이크 사전 점검" aria-busy={isBusy}>
