@@ -1,7 +1,12 @@
-import { normalizeTtsEndpoint, normalizeTtsText, postTransientWav, TtsProviderError } from "./ttsHttp";
+import {
+  normalizeTtsEndpoint,
+  normalizeTtsText,
+  postTransientWav,
+  TtsProviderError,
+} from "./ttsHttp";
 
-export const QWEN3_TTS_MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice";
-export const QWEN3_TTS_SPEAKER = "Sohee";
+export const QWEN3_TTS_MODEL = "Qwen/Qwen3-TTS-12Hz-0.6B-Base";
+export const QWEN3_TTS_SPEAKER = "jobnkill-professor-01";
 
 export interface Qwen3TtsResponse {
   audioUrl: string;
@@ -15,6 +20,7 @@ function getEndpoint(): string | null {
   return normalizeTtsEndpoint(process.env.QWEN3_TTS_URL, {
     allowInsecureHttp: process.env.QWEN3_TTS_ALLOW_INSECURE_HTTP === "true",
     requirePrivateHost: true,
+    allowedHost: process.env.QWEN3_TTS_ALLOWED_HOST,
   });
 }
 
@@ -34,10 +40,7 @@ export function isQwen3TtsConfigured(): boolean {
   return Boolean(process.env.QWEN3_TTS_URL?.trim());
 }
 
-/**
- * Calls the private Qwen3-TTS sidecar. The Korean Sohee preset is fixed server-side;
- * voice cloning and user-provided style instructions are intentionally unsupported.
- */
+/** Calls the private server-side JOB&KILL voice-clone profile. */
 export async function generateQwen3TTS(options: {
   text: string;
   voiceType: string;
@@ -46,8 +49,10 @@ export async function generateQwen3TTS(options: {
   const endpoint = getEndpoint();
   if (!endpoint) throw new TtsProviderError("TTS_CONFIG_ERROR");
 
-  const requestedSpeed = Number.isFinite(options.speed) ? Number(options.speed) : 0.98;
-  const speed = Math.min(1.05, Math.max(0.9, requestedSpeed));
+  const requestedSpeed = Number.isFinite(options.speed)
+    ? Number(options.speed)
+    : 1.02;
+  const speed = Math.min(1.08, Math.max(0.9, requestedSpeed));
   const audio = await postTransientWav({
     endpoint: `${endpoint}/v1/tts`,
     token: getServiceToken(),

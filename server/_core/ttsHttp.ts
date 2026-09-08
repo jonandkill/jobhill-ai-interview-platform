@@ -40,7 +40,12 @@ export function normalizeTtsText(value: string): string {
 
 export function normalizeTtsEndpoint(
   rawValue: string | undefined,
-  options: { allowInsecureHttp: boolean; isProduction?: boolean; requirePrivateHost?: boolean },
+  options: {
+    allowInsecureHttp: boolean;
+    isProduction?: boolean;
+    requirePrivateHost?: boolean;
+    allowedHost?: string;
+  }
 ): string | null {
   const value = rawValue?.trim();
   if (!value) return null;
@@ -53,32 +58,53 @@ export function normalizeTtsEndpoint(
   }
 
   const hostname = endpoint.hostname.replace(/^\[|\]$/g, "").toLowerCase();
-  const ipv4Parts = hostname.split(".").map(Number);
-  const isPrivateIpv4 = ipv4Parts.length === 4 && ipv4Parts.every(Number.isInteger) && (
-    ipv4Parts[0] === 10 ||
-    ipv4Parts[0] === 127 ||
-    (ipv4Parts[0] === 172 && ipv4Parts[1] >= 16 && ipv4Parts[1] <= 31) ||
-    (ipv4Parts[0] === 192 && ipv4Parts[1] === 168)
+  const allowedHost = options.allowedHost?.trim().toLowerCase();
+  if (
+    allowedHost &&
+    (!/^[a-z0-9.-]+$/.test(allowedHost) || allowedHost.includes(".."))
+  ) {
+    throw new TtsProviderError("TTS_CONFIG_ERROR");
+  }
+  const isExplicitlyAllowedHost = Boolean(
+    allowedHost && hostname === allowedHost
   );
+  const ipv4Parts = hostname.split(".").map(Number);
+  const isPrivateIpv4 =
+    ipv4Parts.length === 4 &&
+    ipv4Parts.every(Number.isInteger) &&
+    (ipv4Parts[0] === 10 ||
+      ipv4Parts[0] === 127 ||
+      (ipv4Parts[0] === 172 && ipv4Parts[1] >= 16 && ipv4Parts[1] <= 31) ||
+      (ipv4Parts[0] === 192 && ipv4Parts[1] === 168));
   const isPrivateHost =
     hostname === "localhost" ||
     hostname === "::1" ||
-    (hostname.includes(":") && (hostname.startsWith("fc") || hostname.startsWith("fd"))) ||
+    (hostname.includes(":") &&
+      (hostname.startsWith("fc") || hostname.startsWith("fd"))) ||
     isPrivateIpv4 ||
     !hostname.includes(".") ||
     hostname.endsWith(".internal") ||
     hostname.endsWith(".local") ||
     hostname.endsWith(".cluster.local");
-  const isLoopback = hostname === "localhost" || hostname === "::1" || (isPrivateIpv4 && ipv4Parts[0] === 127);
-  const isProduction = options.isProduction ?? process.env.NODE_ENV === "production";
+  const isLoopback =
+    hostname === "localhost" ||
+    hostname === "::1" ||
+    (isPrivateIpv4 && ipv4Parts[0] === 127);
+  const isProduction =
+    options.isProduction ?? process.env.NODE_ENV === "production";
   if (
     !["http:", "https:"].includes(endpoint.protocol) ||
     endpoint.username ||
     endpoint.password ||
     endpoint.search ||
     endpoint.hash ||
-    (options.requirePrivateHost && !isPrivateHost) ||
-    (isProduction && endpoint.protocol !== "https:" && !isLoopback && !options.allowInsecureHttp)
+    (options.requirePrivateHost &&
+      !isPrivateHost &&
+      !isExplicitlyAllowedHost) ||
+    (isProduction &&
+      endpoint.protocol !== "https:" &&
+      !isLoopback &&
+      !options.allowInsecureHttp)
   ) {
     throw new TtsProviderError("TTS_CONFIG_ERROR");
   }
@@ -88,11 +114,22 @@ export function normalizeTtsEndpoint(
 }
 
 function hasWavMagic(audio: Buffer): boolean {
-  return audio.length >= 12 && audio.toString("ascii", 0, 4) === "RIFF" && audio.toString("ascii", 8, 12) === "WAVE";
+  return (
+    audio.length >= 12 &&
+    audio.toString("ascii", 0, 4) === "RIFF" &&
+    audio.toString("ascii", 8, 12) === "WAVE"
+  );
 }
 
-async function readBoundedWav(response: Response, abort: AbortController): Promise<Buffer> {
-  const contentType = response.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase();
+async function readBoundedWav(
+  response: Response,
+  abort: AbortController
+): Promise<Buffer> {
+  const contentType = response.headers
+    .get("content-type")
+    ?.split(";", 1)[0]
+    ?.trim()
+    .toLowerCase();
   if (contentType !== "audio/wav" && contentType !== "audio/x-wav") {
     throw new TtsProviderError("TTS_INVALID_AUDIO");
   }
@@ -121,7 +158,9 @@ async function readBoundedWav(response: Response, abort: AbortController): Promi
   }
 
   const audio = Buffer.concat(chunks, totalBytes);
-  if (audio.length < 44 || !hasWavMagic(audio)) throw new TtsProviderError("TTS_INVALID_AUDIO");
+  if (audio.length < 44 || !hasWavMagic(audio)) {
+    throw new TtsProviderError("TTS_INVALID_AUDIO");
+  }
   return audio;
 }
 
@@ -133,7 +172,10 @@ export async function postTransientWav(options: {
   fetchImpl?: typeof fetch;
 }): Promise<Buffer> {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), options.timeoutMs ?? 20_000);
+  const timeout = setTimeout(
+    () => controller.abort(),
+    options.timeoutMs ?? 20_000
+  );
   timeout.unref?.();
 
   try {
@@ -142,7 +184,9 @@ export async function postTransientWav(options: {
       "cache-control": "no-store",
       accept: "audio/wav",
     };
-    if (options.token?.trim()) headers.authorization = `Bearer ${options.token.trim()}`;
+    if (options.token?.trim()) {
+      headers.authorization = `Bearer ${options.token.trim()}`;
+    }
 
     const response = await (options.fetchImpl ?? fetch)(options.endpoint, {
       method: "POST",

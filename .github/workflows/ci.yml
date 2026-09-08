@@ -24,6 +24,9 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v4
 
+      - name: Validate private Qwen voice service
+        run: python -m unittest discover -s services/qwen3-tts -p "test_*.py"
+
       - name: Install pnpm
         uses: pnpm/action-setup@v4
         with:
