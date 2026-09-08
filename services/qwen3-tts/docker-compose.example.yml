@@ -1,0 +1,38 @@
+services:
+  qwen3-tts:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:7790:8000"
+    environment:
+      QWEN_MODEL_PATH: /models/Qwen3-TTS-12Hz-0.6B-Base
+      QWEN_MODEL_REVISION: 5d83992436eae1d760afd27aff78a71d676296fc
+      QWEN_DEVICE: cuda:0
+      QWEN_ATTENTION: sdpa
+      VOICE_REFERENCE_AUDIO_PATH: /voices/jobnkill-professor-01/reference.wav
+      VOICE_REFERENCE_TEXT_PATH: /voices/jobnkill-professor-01/reference.txt
+      TTS_SERVICE_TOKEN_FILE: /run/secrets/tts_service_token
+      TTS_MAX_CONCURRENCY: "1"
+    volumes:
+      - ./models:/models:ro
+      - ./private-voices:/voices:ro
+    secrets:
+      - tts_service_token
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,noexec,nosuid,nodev
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+secrets:
+  tts_service_token:
+    file: ./secrets/tts_service_token

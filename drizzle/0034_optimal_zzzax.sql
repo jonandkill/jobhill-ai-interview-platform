@@ -1,0 +1,1 @@
+ALTER TABLE `interview_qa` ADD `audioUrl` varchar(512);
